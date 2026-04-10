@@ -358,27 +358,29 @@ fn parse_makefile(content: &str, dag: &mut Dag) -> Result<(), String> {
 
             let target_part = trimmed[..colon_pos].trim();
             cur_tgt = target_part.to_string();
-            let is_phony = target_part == ".PHONY";
-            dag.ensure_node(target_part, is_phony);
+            // Expand variables in target and prerequisites
+            let expanded_target = expand_vars_simple(target_part, &dag.variables);
+            let expanded_prereqs = expand_vars_simple(after_colon.trim(), &dag.variables);
+
+            let is_phony = expanded_target == ".PHONY";
+            dag.ensure_node(&expanded_target, is_phony);
 
             // Handle .PHONY: the listed targets are phony
-            if target_part == ".PHONY" {
-                let prereqs_part = after_colon.trim();
-                for name in prereqs_part.split_whitespace() {
+            if expanded_target == ".PHONY" {
+                for name in expanded_prereqs.split_whitespace() {
                     phony_targets.push(name.to_string());
                     dag.ensure_node(name, true);
                 }
-            } else if target_part != ".SUFFIXES"
-                && !target_part.starts_with('.')
+            } else if expanded_target != ".SUFFIXES"
+                && !expanded_target.starts_with('.')
                 && dag.default_target.is_none()
             {
-                dag.set_default(target_part);
+                dag.set_default(&expanded_target);
             }
 
-            let prereqs_part = after_colon.trim();
-            if !prereqs_part.is_empty() && target_part != ".PHONY" {
-                for prereq in prereqs_part.split_whitespace() {
-                    dag.add_prereq(target_part, prereq);
+            if !expanded_prereqs.is_empty() && expanded_target != ".PHONY" {
+                for prereq in expanded_prereqs.split_whitespace() {
+                    dag.add_prereq(&expanded_target, prereq);
                 }
             }
         }
@@ -429,6 +431,46 @@ impl AutoVar {
             Self::AllPrereqs => node.prereqs.join(" "),
         }
     }
+}
+
+fn expand_vars_simple(text: &str, variables: &HashMap<String, String>) -> String {
+    let mut out = String::new();
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '$' && i + 1 < chars.len() {
+            let next = chars[i + 1];
+            if next == '$' {
+                out.push('$');
+                i += 2;
+            } else if next == '(' {
+                if let Some((name, args, consumed)) = parse_function_call(&chars, i + 1) {
+                    let expanded =
+                        expand_function(&name, &args, &DagNode::new("".into(), false), variables);
+                    out.push_str(&expanded);
+                    i += consumed;
+                } else {
+                    out.push(chars[i]);
+                    i += 1;
+                }
+            } else if next.is_alphanumeric() || next == '_' {
+                if let Some((name, consumed)) = parse_simple_var(&chars, i + 1) {
+                    out.push_str(variables.get(&name).cloned().unwrap_or_default().as_str());
+                    i += consumed;
+                } else {
+                    out.push(chars[i]);
+                    i += 1;
+                }
+            } else {
+                out.push(chars[i]);
+                i += 1;
+            }
+        } else {
+            out.push(chars[i]);
+            i += 1;
+        }
+    }
+    out
 }
 
 fn expand_vars(cmd: &str, node: &DagNode, variables: &HashMap<String, String>) -> String {
@@ -612,7 +654,7 @@ impl Executor {
         }
     }
 
-    fn run(&mut self, nodes: &[&DagNode]) -> bool {
+    fn run(&mut self, nodes: &[&DagNode], target: &str) -> bool {
         let mut built_something = false;
         for nd in nodes {
             if !nd.needs_rebuild() {
@@ -627,9 +669,7 @@ impl Executor {
             }
         }
         if !built_something {
-            if let Some(first) = nodes.first() {
-                println!("mkultra: nothing to be done for '{}'", first.target);
-            }
+            println!("mkultra: nothing to be done for '{}'", target);
         }
         self.errors == 0
     }
@@ -755,7 +795,7 @@ fn main() -> ExitCode {
 
     // Execute
     let mut executor = Executor::new(args.keep_going, args.dry_run, dag.variables.clone());
-    if executor.run(&nodes) {
+    if executor.run(&nodes, &build_target) {
         ExitCode::SUCCESS
     } else {
         ExitCode::from(1)
@@ -1277,6 +1317,23 @@ app: main.o utils.o
     }
 
     #[test]
+    fn test_parse_variable_expansion_in_prereqs() {
+        let content = "SOURCES = foo.c bar.c\nall: $(SOURCES)\n";
+        let mut dag = Dag::new();
+        parse_makefile(content, &mut dag).unwrap();
+        assert_eq!(dag.nodes["all"].prereqs, vec!["foo.c", "bar.c"]);
+    }
+
+    #[test]
+    fn test_parse_variable_expansion_in_target() {
+        let content = "TARGET = app\n$(TARGET): main.c\n";
+        let mut dag = Dag::new();
+        parse_makefile(content, &mut dag).unwrap();
+        assert!(dag.nodes.contains_key("app"));
+        assert_eq!(dag.nodes["app"].prereqs, vec!["main.c"]);
+    }
+
+    #[test]
     fn test_parse_real_world_makefile() {
         let content = "\
 CC = gcc
@@ -1306,7 +1363,7 @@ clean:
         );
         assert!(dag.nodes.contains_key("all"));
         assert!(dag.nodes.contains_key("clean"));
-        assert_eq!(dag.nodes["$(TARGET)"].prereqs, vec!["main.o", "utils.o"]);
+        assert_eq!(dag.nodes["app"].prereqs, vec!["main.o", "utils.o"]);
     }
 
     // -- Staleness --
@@ -1339,7 +1396,7 @@ clean:
         node.recipes.push("@echo silent".to_string());
 
         let mut exec = Executor::new(false, true, HashMap::new());
-        let ok = exec.run(&[&node]);
+        let ok = exec.run(&[&node], "all");
         assert!(ok);
         assert_eq!(exec.errors, 0);
     }
@@ -1350,7 +1407,7 @@ clean:
         node.recipes.push("@echo silent".to_string());
 
         let mut exec = Executor::new(false, true, HashMap::new());
-        let ok = exec.run(&[&node]);
+        let ok = exec.run(&[&node], "all");
         assert!(ok);
     }
 
