@@ -1,0 +1,7 @@
+[package]
+name = "mkultra"
+version = "0.1.0"
+edition = "2021"
+description = "A minimal, Unix-philosophy-compliant build tool"
+
+[dependencies]
