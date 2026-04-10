@@ -372,10 +372,9 @@ fn parse_makefile(content: &str, dag: &mut Dag) -> Result<(), String> {
             }
 
             let target_part = trimmed[..colon_pos].trim();
-            cur_tgt = target_part.to_string();
-            // Expand variables in target and prerequisites
             let expanded_target = expand_vars_simple(target_part, &dag.variables);
             let expanded_prereqs = expand_vars_simple(after_colon.trim(), &dag.variables);
+            cur_tgt = expanded_target.to_string();
 
             let is_phony = expanded_target == ".PHONY";
             dag.ensure_node(&expanded_target, is_phony);
@@ -1669,5 +1668,75 @@ clean:
         assert_eq!(order.len(), 2);
         assert_eq!(order[0].target, "phantom");
         assert_eq!(order[1].target, "all");
+    }
+
+    // -- Variable expansion in target names --
+
+    #[test]
+    fn test_parse_variable_in_target_name() {
+        let content = "TARGET = app\n$(TARGET): main.o\n\t$(CC) -o $(TARGET) main.o\n";
+        let mut dag = Dag::new();
+        parse_makefile(content, &mut dag).unwrap();
+        assert!(dag.nodes.contains_key("app"));
+        assert_eq!(dag.nodes["app"].prereqs, vec!["main.o"]);
+        assert_eq!(dag.nodes["app"].recipes.len(), 1);
+        let recipe = &dag.nodes["app"].recipes[0];
+        assert!(recipe.contains("$(CC)"));
+        assert!(recipe.contains("$(TARGET)"));
+    }
+
+    #[test]
+    fn test_parse_variable_in_target_name_phony_depends_on_build() {
+        let content = "\
+TARGET = mybin
+.PHONY: install
+
+$(TARGET):
+\tbuild.sh
+
+install: $(TARGET)
+\tinstall.sh
+";
+        let mut dag = Dag::new();
+        parse_makefile(content, &mut dag).unwrap();
+        assert!(dag.nodes.contains_key("mybin"));
+        assert!(dag.nodes.contains_key("install"));
+        assert!(dag.nodes["install"].is_phony);
+        assert_eq!(dag.nodes["install"].prereqs, vec!["mybin"]);
+        assert_eq!(dag.nodes["mybin"].recipes.len(), 1);
+        assert_eq!(dag.nodes["mybin"].recipes[0], "build.sh");
+        assert_eq!(dag.nodes["install"].recipes.len(), 1);
+        assert_eq!(dag.nodes["install"].recipes[0], "install.sh");
+
+        let order = dag.order("install").unwrap();
+        let names: Vec<&str> = order.iter().map(|n| n.target.as_str()).collect();
+        assert_eq!(names, vec!["mybin", "install"]);
+    }
+
+    #[test]
+    fn test_parse_phony_depends_on_nonexistent_target() {
+        let content = "\
+.PHONY: install
+
+mybin:
+\tbuild.sh
+
+install: mybin
+\tinstall.sh
+";
+        let mut dag = Dag::new();
+        parse_makefile(content, &mut dag).unwrap();
+        assert!(dag.nodes["install"].is_phony);
+        assert_eq!(dag.nodes["install"].prereqs, vec!["mybin"]);
+        assert_eq!(dag.nodes["mybin"].recipes.len(), 1);
+        assert_eq!(dag.nodes["mybin"].recipes[0], "build.sh");
+
+        let order = dag.order("install").unwrap();
+        let names: Vec<&str> = order.iter().map(|n| n.target.as_str()).collect();
+        assert_eq!(names, vec!["mybin", "install"]);
+
+        let mybin_node = &dag.nodes["mybin"];
+        assert!(mybin_node.needs_rebuild());
+        assert!(!mybin_node.recipes.is_empty());
     }
 }
