@@ -349,15 +349,70 @@ fn parse_makefile(content: &str, dag: &mut Dag) -> Result<(), String> {
             continue;
         }
 
-        // Check for variable assignment (VAR = value)
-        if let Some(eq_pos) = trimmed.find('=') {
-            let lhs = trimmed[..eq_pos].trim();
-            let rhs = trimmed[eq_pos + 1..].trim();
-            if !lhs.is_empty() && !lhs.contains(' ') && !lhs.contains('=') {
-                dag.set_variable(lhs, rhs.to_string());
+        // Check for simply-expanded variable assignment (VAR := value)
+        if let Some(colon_eq) = trimmed.find(":=") {
+            let lhs = trimmed[..colon_eq].trim();
+            let rhs = trimmed[colon_eq + 2..].trim();
+            if !lhs.is_empty() && !lhs.contains(' ') {
+                // Expand rhs immediately for := assignment
+                let expanded_rhs = expand_vars_simple(rhs, &dag.variables);
+                dag.set_variable(lhs, expanded_rhs);
                 cur_tgt.clear();
                 i += 1;
                 continue;
+            }
+        }
+
+        // Check for recursively-expanded variable assignment (VAR = value)
+        // Must also handle ?= (conditional) and += (append)
+        if let Some(eq_pos) = trimmed.find('=') {
+            let before_eq = &trimmed[..eq_pos];
+            // Skip := (already handled above) and ::=
+            if before_eq.ends_with(':') {
+                // Not our case (handled above as :=)
+            } else {
+                let lhs = before_eq.trim();
+                let char_before = trimmed.chars().nth(eq_pos.saturating_sub(1));
+                // Check for ?= or += by looking at what's before the =
+                let is_question_or_plus = char_before == Some('?') || char_before == Some('+');
+                let lhs_for_store = if is_question_or_plus {
+                    &lhs[..lhs.len() - 1].trim()
+                } else {
+                    lhs
+                };
+                // Make sure lhs doesn't contain : (would be a rule, not a variable)
+                if !lhs_for_store.is_empty()
+                    && !lhs_for_store.contains(' ')
+                    && !lhs_for_store.contains(':')
+                {
+                    if char_before == Some('?') {
+                        // ?= : only set if not already defined
+                        if !dag.variables.contains_key(lhs_for_store) {
+                            dag.set_variable(
+                                lhs_for_store,
+                                trimmed[eq_pos + 1..].trim().to_string(),
+                            );
+                        }
+                    } else if char_before == Some('+') {
+                        // += : append
+                        let current = dag
+                            .variables
+                            .get(lhs_for_store)
+                            .cloned()
+                            .unwrap_or_default();
+                        let sep = if current.is_empty() { "" } else { " " };
+                        dag.set_variable(
+                            lhs_for_store,
+                            current + sep + trimmed[eq_pos + 1..].trim(),
+                        );
+                    } else {
+                        let rhs = trimmed[eq_pos + 1..].trim();
+                        dag.set_variable(lhs_for_store, rhs.to_string());
+                    }
+                    cur_tgt.clear();
+                    i += 1;
+                    continue;
+                }
             }
         }
 
@@ -1738,5 +1793,83 @@ install: mybin
         let mybin_node = &dag.nodes["mybin"];
         assert!(mybin_node.needs_rebuild());
         assert!(!mybin_node.recipes.is_empty());
+    }
+
+    // -- Simply-expanded (:=) variable assignment --
+
+    #[test]
+    fn test_parse_simple_assignment() {
+        let content = "BUILD := build\nall: $(BUILD)\n";
+        let mut dag = Dag::new();
+        parse_makefile(content, &mut dag).unwrap();
+        assert_eq!(
+            dag.variables.get("BUILD").map(|s| s.as_str()),
+            Some("build")
+        );
+    }
+
+    #[test]
+    fn test_parse_simple_assignment_expands_rhs() {
+        let content = "SRC = src\nBUILD := $(SRC)/out\nall: $(BUILD)\n";
+        let mut dag = Dag::new();
+        parse_makefile(content, &mut dag).unwrap();
+        assert_eq!(
+            dag.variables.get("BUILD").map(|s| s.as_str()),
+            Some("src/out")
+        );
+    }
+
+    #[test]
+    fn test_parse_simple_assignment_not_rule() {
+        let content = "PKG := discord-cli\nall: $(PKG)\n";
+        let mut dag = Dag::new();
+        parse_makefile(content, &mut dag).unwrap();
+        assert!(!dag.nodes.contains_key("PKG"));
+        assert_eq!(
+            dag.variables.get("PKG").map(|s| s.as_str()),
+            Some("discord-cli")
+        );
+    }
+
+    // -- Conditional (?=) variable assignment --
+
+    #[test]
+    fn test_parse_conditional_assignment_undef() {
+        let content = "CC ?= cc\nall:\n";
+        let mut dag = Dag::new();
+        parse_makefile(content, &mut dag).unwrap();
+        assert_eq!(dag.variables.get("CC").map(|s| s.as_str()), Some("cc"));
+    }
+
+    #[test]
+    fn test_parse_conditional_assignment_existing() {
+        let content = "CC = gcc\nCC ?= cc\nall:\n";
+        let mut dag = Dag::new();
+        parse_makefile(content, &mut dag).unwrap();
+        assert_eq!(dag.variables.get("CC").map(|s| s.as_str()), Some("gcc"));
+    }
+
+    // -- Append (+=) variable assignment --
+
+    #[test]
+    fn test_parse_append_assignment() {
+        let content = "CFLAGS = -Wall\nCFLAGS += -O2\nall:\n";
+        let mut dag = Dag::new();
+        parse_makefile(content, &mut dag).unwrap();
+        assert_eq!(
+            dag.variables.get("CFLAGS").map(|s| s.as_str()),
+            Some("-Wall -O2")
+        );
+    }
+
+    #[test]
+    fn test_parse_append_assignment_empty() {
+        let content = "CFLAGS += -Wall\nall:\n";
+        let mut dag = Dag::new();
+        parse_makefile(content, &mut dag).unwrap();
+        assert_eq!(
+            dag.variables.get("CFLAGS").map(|s| s.as_str()),
+            Some("-Wall")
+        );
     }
 }
