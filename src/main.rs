@@ -151,6 +151,7 @@ fn file_mtime(path: &str) -> u64 {
 #[derive(Debug)]
 struct Dag {
     nodes: HashMap<String, DagNode>,
+    variables: HashMap<String, String>,
     default_target: Option<String>,
 }
 
@@ -158,8 +159,13 @@ impl Dag {
     fn new() -> Self {
         Self {
             nodes: HashMap::new(),
+            variables: HashMap::new(),
             default_target: None,
         }
+    }
+
+    fn set_variable(&mut self, name: &str, value: String) {
+        self.variables.insert(name.to_string(), value);
     }
 
     fn ensure_node(&mut self, target: &str, is_phony: bool) -> &mut DagNode {
@@ -353,12 +359,22 @@ fn parse_makefile(content: &str, dag: &mut Dag) -> Result<(), String> {
             continue;
         }
 
+        // Check for variable assignment (VAR = value)
+        if let Some(eq_pos) = trimmed.find('=') {
+            let lhs = trimmed[..eq_pos].trim();
+            let rhs = trimmed[eq_pos + 1..].trim();
+            if !lhs.is_empty() && !lhs.contains(' ') && !lhs.contains('=') {
+                dag.set_variable(lhs, rhs.to_string());
+                cur_tgt.clear();
+                continue;
+            }
+        }
+
         // Look for `target: prereqs` (rule line, not a variable assignment)
         if let Some(colon_pos) = trimmed.find(':') {
             // Make sure it's not a variable assignment `:=` or `::=` etc.
             let after_colon = &trimmed[colon_pos + 1..];
             if after_colon.starts_with('=') {
-                // This is a variable assignment, skip for now
                 cur_tgt.clear();
                 continue;
             }
@@ -474,7 +490,7 @@ impl AutoVar {
     }
 }
 
-fn expand_auto_vars(cmd: &str, node: &DagNode) -> String {
+fn expand_vars(cmd: &str, node: &DagNode, variables: &HashMap<String, String>) -> String {
     let mut out = String::new();
     let chars: Vec<char> = cmd.chars().collect();
     let mut i = 0;
@@ -495,29 +511,9 @@ fn expand_auto_vars(cmd: &str, node: &DagNode) -> String {
             }
 
             if next == '(' {
-                if let Some((var, consumed)) = parse_parenthesized_var(&chars, i + 1) {
-                    match var.as_str() {
-                        "@D" => out.push_str(&AutoVar::Target.dir_part(node)),
-                        "@F" => out.push_str(&AutoVar::Target.file_part(node)),
-                        "<D" => out.push_str(&AutoVar::FirstPrereq.dir_part(node)),
-                        "<F" => out.push_str(&AutoVar::FirstPrereq.file_part(node)),
-                        "^D" => out.push_str(&AutoVar::AllPrereqs.dir_part(node)),
-                        "^F" => out.push_str(&AutoVar::AllPrereqs.file_part(node)),
-                        "+D" => out.push_str(&AutoVar::AllPrereqsDups.dir_part(node)),
-                        "+F" => out.push_str(&AutoVar::AllPrereqsDups.file_part(node)),
-                        "?D" => out.push_str(&AutoVar::NewerPrereqs.dir_part(node)),
-                        "?F" => out.push_str(&AutoVar::NewerPrereqs.file_part(node)),
-                        "*D" => out.push_str(&AutoVar::Stem.dir_part(node)),
-                        "*F" => out.push_str(&AutoVar::Stem.file_part(node)),
-                        "|D" => out.push_str(&AutoVar::OrderOnly.dir_part(node)),
-                        "|F" => out.push_str(&AutoVar::OrderOnly.file_part(node)),
-                        _ => {
-                            out.push('$');
-                            out.push('(');
-                            out.push_str(&var);
-                            out.push(')');
-                        }
-                    }
+                if let Some((name, args, consumed)) = parse_function_call(&chars, i + 1) {
+                    let expanded = expand_function(&name, &args, node, variables);
+                    out.push_str(&expanded);
                     i += consumed;
                     continue;
                 }
@@ -527,6 +523,15 @@ fn expand_auto_vars(cmd: &str, node: &DagNode) -> String {
                 out.push_str(&var.expand(node));
                 i += 2;
                 continue;
+            }
+
+            if next.is_alphanumeric() || next == '_' {
+                if let Some((name, consumed)) = parse_simple_var(&chars, i + 1) {
+                    let expanded = variables.get(&name).cloned().unwrap_or_default();
+                    out.push_str(&expanded);
+                    i += consumed;
+                    continue;
+                }
             }
 
             out.push('$');
@@ -539,9 +544,23 @@ fn expand_auto_vars(cmd: &str, node: &DagNode) -> String {
     out
 }
 
-fn parse_parenthesized_var(chars: &[char], start: usize) -> Option<(String, usize)> {
+fn parse_simple_var(chars: &[char], start: usize) -> Option<(String, usize)> {
+    let mut end = start;
+    while end < chars.len() && (chars[end].is_alphanumeric() || chars[end] == '_') {
+        end += 1;
+    }
+    if end > start {
+        let name: String = chars[start..end].iter().collect();
+        Some((name, 1 + end - start))
+    } else {
+        None
+    }
+}
+
+fn parse_function_call(chars: &[char], start: usize) -> Option<(String, String, usize)> {
     let mut depth = 1;
     let mut i = start + 1;
+
     while i < chars.len() && depth > 0 {
         match chars[i] {
             '(' => depth += 1,
@@ -550,12 +569,415 @@ fn parse_parenthesized_var(chars: &[char], start: usize) -> Option<(String, usiz
         }
         i += 1;
     }
+
     if depth == 0 {
-        let var_name: String = chars[start + 1..i - 1].iter().collect();
-        Some((var_name, i - start + 1))
+        let full: String = chars[start + 1..i - 1].iter().collect();
+        if let Some((name, args)) = full.split_once('(') {
+            let args = &args[..args.len().saturating_sub(1)];
+            return Some((name.to_string(), args.to_string(), i - start + 1));
+        }
+        if let Some((name, args)) = full.split_once(',') {
+            return Some((name.to_string(), args.to_string(), i - start + 1));
+        }
+        Some((full, String::new(), i - start + 1))
     } else {
         None
     }
+}
+
+// ---------------------------------------------------------------------------
+// Variable functions
+// ---------------------------------------------------------------------------
+
+fn expand_function(
+    name: &str,
+    args: &str,
+    node: &DagNode,
+    variables: &HashMap<String, String>,
+) -> String {
+    match name {
+        "@D" => AutoVar::Target.dir_part(node),
+        "@F" => AutoVar::Target.file_part(node),
+        "<D" => AutoVar::FirstPrereq.dir_part(node),
+        "<F" => AutoVar::FirstPrereq.file_part(node),
+        "^D" => AutoVar::AllPrereqs.dir_part(node),
+        "^F" => AutoVar::AllPrereqs.file_part(node),
+        "+D" => AutoVar::AllPrereqsDups.dir_part(node),
+        "+F" => AutoVar::AllPrereqsDups.file_part(node),
+        "?D" => AutoVar::NewerPrereqs.dir_part(node),
+        "?F" => AutoVar::NewerPrereqs.file_part(node),
+        "*D" => AutoVar::Stem.dir_part(node),
+        "*F" => AutoVar::Stem.file_part(node),
+        "|D" => AutoVar::OrderOnly.dir_part(node),
+        "|F" => AutoVar::OrderOnly.file_part(node),
+        "wildcard" => expand_wildcard(args),
+        "subst" => expand_subst(args),
+        "patsubst" => expand_patsubst(args),
+        "shell" => expand_shell(args),
+        "dir" => expand_dir(args),
+        "notdir" => expand_notdir(args),
+        "suffix" => expand_suffix(args),
+        "basename" => expand_basename(args),
+        "addsuffix" => expand_addsuffix(args),
+        "addprefix" => expand_addprefix(args),
+        "filter" => expand_filter(args),
+        "filter-out" => expand_filter_out(args),
+        "sort" => expand_sort(args),
+        "word" => expand_word(args),
+        "words" => expand_words(args),
+        "firstword" => expand_firstword(args),
+        "lastword" => expand_lastword(args),
+        "strip" => expand_strip(args),
+        "findstring" => expand_findstring(args),
+        "join" => expand_join(args),
+        _ => variables.get(name).cloned().unwrap_or_default(),
+    }
+}
+
+fn split_args(s: &str) -> Vec<String> {
+    let mut result = Vec::new();
+    let mut current = String::new();
+    let mut depth = 0;
+    let mut in_paren = false;
+
+    for ch in s.chars() {
+        match ch {
+            '(' => {
+                depth += 1;
+                current.push(ch);
+            }
+            ')' => {
+                depth -= 1;
+                current.push(ch);
+            }
+            ',' if depth == 0 && !in_paren => {
+                result.push(current.trim().to_string());
+                current.clear();
+            }
+            _ => {
+                if ch == '\'' || ch == '"' {
+                    in_paren = !in_paren;
+                }
+                current.push(ch);
+            }
+        }
+    }
+    if !current.trim().is_empty() {
+        result.push(current.trim().to_string());
+    }
+    result
+}
+
+fn expand_wildcard(pattern: &str) -> String {
+    let pattern = pattern.trim();
+    if !pattern.contains('*') && !pattern.contains('?') {
+        return pattern.to_string();
+    }
+
+    match glob::Pattern::new(pattern) {
+        Ok(pat) => {
+            let dir = if let Some((d, _)) = pattern.rsplit_once('/') {
+                d.to_string()
+            } else {
+                ".".to_string()
+            };
+            let matches: Vec<String> = walkdir::WalkDir::new(&dir)
+                .max_depth(1)
+                .into_iter()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_type().is_file())
+                .filter_map(|e| {
+                    e.path().to_str().and_then(|p| {
+                        if pat.matches(p) {
+                            Some(p.to_string())
+                        } else {
+                            None
+                        }
+                    })
+                })
+                .collect();
+            matches.join(" ")
+        }
+        Err(_) => String::new(),
+    }
+}
+
+fn expand_subst(args: &str) -> String {
+    let parts = split_args(args);
+    if parts.len() < 3 {
+        return args.to_string();
+    }
+    let from = &parts[0];
+    let to = &parts[1];
+    let text = &parts[2];
+    text.replace(from, to)
+}
+
+fn expand_patsubst(args: &str) -> String {
+    let parts = split_args(args);
+    if parts.len() < 3 {
+        return args.to_string();
+    }
+    let pattern = parts[0].trim();
+    let replacement = parts[1].trim();
+    let text = parts[2].trim();
+
+    let mut result = Vec::new();
+    for word in text.split_whitespace() {
+        if pattern.contains('%') {
+            let pct_idx = pattern.find('%').unwrap();
+            let pfx = &pattern[..pct_idx];
+            let sfx = &pattern[pct_idx + 1..];
+            if word.starts_with(pfx) && (sfx.is_empty() || word.ends_with(sfx)) {
+                let rest = &word[pfx.len()..word.len().saturating_sub(sfx.len())];
+                let repl = replacement.replace("%", rest);
+                result.push(repl);
+            } else {
+                result.push(word.to_string());
+            }
+        } else if word == pattern {
+            result.push(replacement.to_string());
+        } else {
+            result.push(word.to_string());
+        }
+    }
+    result.join(" ")
+}
+
+fn expand_shell(cmd: &str) -> String {
+    let cmd = cmd.trim();
+    let output = Command::new("/bin/sh").arg("-c").arg(cmd).output();
+    match output {
+        Ok(out) => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            stdout.split_whitespace().collect::<Vec<_>>().join(" ")
+        }
+        Err(_) => String::new(),
+    }
+}
+
+fn expand_dir(args: &str) -> String {
+    args.split_whitespace()
+        .map(|p| {
+            if let Some((d, _)) = p.rsplit_once('/') {
+                if d.is_empty() {
+                    "."
+                } else {
+                    d
+                }
+            } else {
+                "."
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn expand_notdir(args: &str) -> String {
+    args.split_whitespace()
+        .map(|p| {
+            if let Some((_, f)) = p.rsplit_once('/') {
+                f
+            } else {
+                p
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn expand_suffix(args: &str) -> String {
+    args.split_whitespace()
+        .filter_map(|p| {
+            if let Some(dot) = p.rfind('.') {
+                if dot > p.rfind('/').unwrap_or(0) {
+                    return Some(&p[dot..]);
+                }
+            }
+            None
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn expand_basename(args: &str) -> String {
+    args.split_whitespace()
+        .map(|p| {
+            if let Some(dot) = p.rfind('.') {
+                if dot > p.rfind('/').unwrap_or(0) {
+                    return &p[..dot];
+                }
+            }
+            p
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn expand_addsuffix(args: &str) -> String {
+    let parts = split_args(args);
+    if parts.len() < 2 {
+        return args.to_string();
+    }
+    let suffix = parts[0].trim();
+    let words: Vec<&str> = parts[1].split_whitespace().collect();
+    words
+        .iter()
+        .map(|w| format!("{}{}", w, suffix))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn expand_addprefix(args: &str) -> String {
+    let parts = split_args(args);
+    if parts.len() < 2 {
+        return args.to_string();
+    }
+    let prefix = parts[0].trim();
+    let words: Vec<&str> = parts[1].split_whitespace().collect();
+    words
+        .iter()
+        .map(|w| format!("{}{}", prefix, w))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn expand_filter(args: &str) -> String {
+    if let Some((patterns_str, text)) = args.split_once(',') {
+        let patterns: Vec<&str> = patterns_str.split_whitespace().collect();
+        let words: Vec<&str> = text.split_whitespace().collect();
+
+        let mut result = Vec::new();
+        for word in words {
+            for pattern in &patterns {
+                if match glob::Pattern::new(pattern) {
+                    Ok(pat) => pat.matches(word),
+                    Err(_) => {
+                        if pattern.contains('%') {
+                            let pct_idx = pattern.find('%').unwrap();
+                            let prefix = &pattern[..pct_idx];
+                            let suffix = &pattern[pct_idx + 1..];
+                            word.starts_with(prefix)
+                                && (suffix.is_empty() || word.ends_with(suffix))
+                        } else {
+                            &*word == *pattern
+                        }
+                    }
+                } {
+                    result.push(word);
+                    break;
+                }
+            }
+        }
+        result.join(" ")
+    } else {
+        String::new()
+    }
+}
+
+fn expand_filter_out(args: &str) -> String {
+    if let Some((patterns_str, text)) = args.split_once(',') {
+        let patterns: Vec<&str> = patterns_str.split_whitespace().collect();
+        let words: Vec<&str> = text.split_whitespace().collect();
+
+        let mut result = Vec::new();
+        for word in words {
+            let mut matched = false;
+            for pattern in &patterns {
+                matched = match glob::Pattern::new(pattern) {
+                    Ok(pat) => pat.matches(word),
+                    Err(_) => {
+                        if pattern.contains('%') {
+                            let pct_idx = pattern.find('%').unwrap();
+                            let prefix = &pattern[..pct_idx];
+                            let suffix = &pattern[pct_idx + 1..];
+                            word.starts_with(prefix)
+                                && (suffix.is_empty() || word.ends_with(suffix))
+                        } else {
+                            &*word == *pattern
+                        }
+                    }
+                };
+                if matched {
+                    break;
+                }
+            }
+            if !matched {
+                result.push(word);
+            }
+        }
+        result.join(" ")
+    } else {
+        args.to_string()
+    }
+}
+
+fn expand_sort(args: &str) -> String {
+    let mut words: Vec<String> = args.split_whitespace().map(|s| s.to_string()).collect();
+    words.sort();
+    words.dedup();
+    words.join(" ")
+}
+
+fn expand_word(args: &str) -> String {
+    let parts = split_args(args);
+    if parts.len() < 2 {
+        return String::new();
+    }
+    let n: usize = parts[0].trim().parse().unwrap_or(0);
+    let words: Vec<&str> = parts[1].split_whitespace().collect();
+    if n > 0 && n <= words.len() {
+        words[n - 1].to_string()
+    } else {
+        String::new()
+    }
+}
+
+fn expand_words(args: &str) -> String {
+    args.split_whitespace().count().to_string()
+}
+
+fn expand_firstword(args: &str) -> String {
+    args.split_whitespace().next().unwrap_or("").to_string()
+}
+
+fn expand_lastword(args: &str) -> String {
+    args.split_whitespace().last().unwrap_or("").to_string()
+}
+
+fn expand_strip(args: &str) -> String {
+    args.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn expand_findstring(args: &str) -> String {
+    let parts = split_args(args);
+    if parts.len() < 2 {
+        return String::new();
+    }
+    let find = parts[0].trim();
+    let in_text = parts[1].trim();
+    if in_text.contains(find) {
+        find.to_string()
+    } else {
+        String::new()
+    }
+}
+
+fn expand_join(args: &str) -> String {
+    let parts = split_args(args);
+    if parts.len() < 2 {
+        return String::new();
+    }
+    let list1: Vec<&str> = parts[0].split_whitespace().collect();
+    let list2: Vec<&str> = parts[1].split_whitespace().collect();
+    let max_len = list1.len().max(list2.len());
+    let mut result = Vec::new();
+    for i in 0..max_len {
+        let a = list1.get(i).unwrap_or(&"");
+        let b = list2.get(i).unwrap_or(&"");
+        result.push(format!("{}{}", a, b));
+    }
+    result.join(" ")
 }
 
 // ---------------------------------------------------------------------------
@@ -566,14 +988,16 @@ struct Executor {
     keep_going: bool,
     dry_run: bool,
     errors: usize,
+    variables: HashMap<String, String>,
 }
 
 impl Executor {
-    fn new(keep_going: bool, dry_run: bool) -> Self {
+    fn new(keep_going: bool, dry_run: bool, variables: HashMap<String, String>) -> Self {
         Self {
             keep_going,
             dry_run,
             errors: 0,
+            variables,
         }
     }
 
@@ -597,7 +1021,7 @@ impl Executor {
         for recipe in &nd.recipes {
             let echo = !recipe.starts_with('@');
             let cmd = recipe.strip_prefix('@').unwrap_or(recipe);
-            let expanded = expand_auto_vars(cmd, nd);
+            let expanded = expand_vars(cmd, nd, &self.variables);
 
             if self.dry_run {
                 if echo {
@@ -713,7 +1137,7 @@ fn main() -> ExitCode {
     };
 
     // Execute
-    let mut executor = Executor::new(args.keep_going, args.dry_run);
+    let mut executor = Executor::new(args.keep_going, args.dry_run, dag.variables.clone());
     if executor.run(&nodes) {
         ExitCode::SUCCESS
     } else {
@@ -993,7 +1417,7 @@ mod tests {
     #[test]
     fn test_expand_at_target() {
         let node = DagNode::new("output.txt".to_string(), false);
-        assert_eq!(expand_auto_vars("$@", &node), "output.txt");
+        assert_eq!(expand_vars("$@", &node, &HashMap::new()), "output.txt");
     }
 
     #[test]
@@ -1001,7 +1425,7 @@ mod tests {
         let mut node = DagNode::new("out".to_string(), false);
         node.prereqs.push("first.o".to_string());
         node.prereqs.push("second.o".to_string());
-        assert_eq!(expand_auto_vars("$<", &node), "first.o");
+        assert_eq!(expand_vars("$<", &node, &HashMap::new()), "first.o");
     }
 
     #[test]
@@ -1009,13 +1433,13 @@ mod tests {
         let mut node = DagNode::new("out".to_string(), false);
         node.prereqs.push("a.o".to_string());
         node.prereqs.push("b.o".to_string());
-        assert_eq!(expand_auto_vars("$^", &node), "a.o b.o");
+        assert_eq!(expand_vars("$^", &node, &HashMap::new()), "a.o b.o");
     }
 
     #[test]
     fn test_expand_dollar_sign() {
         let node = DagNode::new("x".to_string(), false);
-        assert_eq!(expand_auto_vars("$$", &node), "$");
+        assert_eq!(expand_vars("$$", &node, &HashMap::new()), "$");
     }
 
     #[test]
@@ -1023,7 +1447,7 @@ mod tests {
         let mut node = DagNode::new("hello".to_string(), false);
         node.prereqs.push("hello.o".to_string());
         assert_eq!(
-            expand_auto_vars("gcc -o $@ $<", &node),
+            expand_vars("gcc -o $@ $<", &node, &HashMap::new()),
             "gcc -o hello hello.o"
         );
     }
@@ -1032,14 +1456,16 @@ mod tests {
     fn test_expand_unknown_var_passes_through() {
         let node = DagNode::new("x".to_string(), false);
         // $* (stem) is now implemented, should return empty when no stem set
-        assert_eq!(expand_auto_vars("$*", &node), "");
+        assert_eq!(expand_vars("$*", &node, &HashMap::new()), "");
         // $? is now implemented
-        assert_eq!(expand_auto_vars("$?", &node), "");
+        assert_eq!(expand_vars("$?", &node, &HashMap::new()), "");
         // $| is now implemented
-        assert_eq!(expand_auto_vars("$|", &node), "");
-        // unknown vars should pass through
-        assert_eq!(expand_auto_vars("$X", &node), "$X");
-        assert_eq!(expand_auto_vars("$(XXX)", &node), "$(XXX)");
+        assert_eq!(expand_vars("$|", &node, &HashMap::new()), "");
+        // unknown vars now return empty string (variable lookup)
+        assert_eq!(expand_vars("$X", &node, &HashMap::new()), "");
+        assert_eq!(expand_vars("$(XXX)", &node, &HashMap::new()), "");
+        // $$ escapes to $
+        assert_eq!(expand_vars("$$", &node, &HashMap::new()), "$");
     }
 
     #[test]
@@ -1048,15 +1474,15 @@ mod tests {
         node.prereqs.push("a.o".to_string());
         node.prereqs.push("b.o".to_string());
         node.prereqs.push("a.o".to_string());
-        assert_eq!(expand_auto_vars("$+", &node), "a.o b.o a.o");
+        assert_eq!(expand_vars("$+", &node, &HashMap::new()), "a.o b.o a.o");
     }
 
     #[test]
     fn test_expand_stem() {
         let mut node = DagNode::new("foo.bar".to_string(), false);
         node.stem = Some("foo".to_string());
-        assert_eq!(expand_auto_vars("$*", &node), "foo");
-        assert_eq!(expand_auto_vars("file: $*", &node), "file: foo");
+        assert_eq!(expand_vars("$*", &node, &HashMap::new()), "foo");
+        assert_eq!(expand_vars("file: $*", &node, &HashMap::new()), "file: foo");
     }
 
     #[test]
@@ -1064,7 +1490,7 @@ mod tests {
         let mut node = DagNode::new("out".to_string(), false);
         node.prereqs.push("normal.o".to_string());
         node.order_prereqs.push("dir".to_string());
-        assert_eq!(expand_auto_vars("$|", &node), "dir");
+        assert_eq!(expand_vars("$|", &node, &HashMap::new()), "dir");
     }
 
     #[test]
@@ -1073,12 +1499,12 @@ mod tests {
         node.prereqs.push("src/foo/bar.c".to_string());
         node.stem = Some("src/foo/bar".to_string());
 
-        assert_eq!(expand_auto_vars("$(@D)", &node), "src/foo");
-        assert_eq!(expand_auto_vars("$(@F)", &node), "bar.o");
-        assert_eq!(expand_auto_vars("$(<D)", &node), "src/foo");
-        assert_eq!(expand_auto_vars("$(<F)", &node), "bar.c");
-        assert_eq!(expand_auto_vars("$(*D)", &node), "src/foo");
-        assert_eq!(expand_auto_vars("$(*F)", &node), "bar");
+        assert_eq!(expand_vars("$(@D)", &node, &HashMap::new()), "src/foo");
+        assert_eq!(expand_vars("$(@F)", &node, &HashMap::new()), "bar.o");
+        assert_eq!(expand_vars("$(<D)", &node, &HashMap::new()), "src/foo");
+        assert_eq!(expand_vars("$(<F)", &node, &HashMap::new()), "bar.c");
+        assert_eq!(expand_vars("$(*D)", &node, &HashMap::new()), "src/foo");
+        assert_eq!(expand_vars("$(*F)", &node, &HashMap::new()), "bar");
     }
 
     #[test]
@@ -1086,16 +1512,16 @@ mod tests {
         let mut node = DagNode::new("foo.o".to_string(), false);
         node.prereqs.push("foo.c".to_string());
 
-        assert_eq!(expand_auto_vars("$(@D)", &node), ".");
-        assert_eq!(expand_auto_vars("$(@F)", &node), "foo.o");
-        assert_eq!(expand_auto_vars("$(<D)", &node), ".");
-        assert_eq!(expand_auto_vars("$(<F)", &node), "foo.c");
+        assert_eq!(expand_vars("$(@D)", &node, &HashMap::new()), ".");
+        assert_eq!(expand_vars("$(@F)", &node, &HashMap::new()), "foo.o");
+        assert_eq!(expand_vars("$(<D)", &node, &HashMap::new()), ".");
+        assert_eq!(expand_vars("$(<F)", &node, &HashMap::new()), "foo.c");
     }
 
     #[test]
     fn test_expand_trailing_dollar() {
         let node = DagNode::new("x".to_string(), false);
-        assert_eq!(expand_auto_vars("foo$", &node), "foo$");
+        assert_eq!(expand_vars("foo$", &node, &HashMap::new()), "foo$");
     }
 
     #[test]
@@ -1106,8 +1532,279 @@ mod tests {
         node.order_prereqs.push("dir".to_string());
         node.stem = Some("foo".to_string());
 
-        assert_eq!(expand_auto_vars("@=$@ <=$< >=$<", &node), "@=out <=a >=a");
-        assert_eq!(expand_auto_vars("^=$^ +=$+", &node), "^=a b +=a b");
+        assert_eq!(
+            expand_vars("@=$@ <=$< >=$<", &node, &HashMap::new()),
+            "@=out <=a >=a"
+        );
+        assert_eq!(
+            expand_vars("^=$^ +=$+", &node, &HashMap::new()),
+            "^=a b +=a b"
+        );
+    }
+
+    // -- Variable functions --
+
+    #[test]
+    fn test_expand_subst() {
+        let vars = HashMap::new();
+        assert_eq!(
+            expand_function(
+                "subst",
+                "foo,bar,foo foo foo",
+                &DagNode::new("x".into(), false),
+                &vars
+            ),
+            "bar bar bar"
+        );
+    }
+
+    #[test]
+    fn test_expand_patsubst() {
+        let vars = HashMap::new();
+        assert_eq!(
+            expand_function(
+                "patsubst",
+                "%.o,%.c,foo.o bar.o",
+                &DagNode::new("x".into(), false),
+                &vars
+            ),
+            "foo.c bar.c"
+        );
+    }
+
+    #[test]
+    fn test_expand_dir() {
+        let vars = HashMap::new();
+        assert_eq!(
+            expand_function(
+                "dir",
+                "src/foo.c bar.c",
+                &DagNode::new("x".into(), false),
+                &vars
+            ),
+            "src ."
+        );
+    }
+
+    #[test]
+    fn test_expand_notdir() {
+        let vars = HashMap::new();
+        assert_eq!(
+            expand_function(
+                "notdir",
+                "src/foo.c bar.c",
+                &DagNode::new("x".into(), false),
+                &vars
+            ),
+            "foo.c bar.c"
+        );
+    }
+
+    #[test]
+    fn test_expand_suffix() {
+        let vars = HashMap::new();
+        assert_eq!(
+            expand_function(
+                "suffix",
+                "foo.c bar.o baz",
+                &DagNode::new("x".into(), false),
+                &vars
+            ),
+            ".c .o"
+        );
+    }
+
+    #[test]
+    fn test_expand_basename() {
+        let vars = HashMap::new();
+        assert_eq!(
+            expand_function(
+                "basename",
+                "foo.c bar.o baz",
+                &DagNode::new("x".into(), false),
+                &vars
+            ),
+            "foo bar baz"
+        );
+    }
+
+    #[test]
+    fn test_expand_addsuffix() {
+        let vars = HashMap::new();
+        assert_eq!(
+            expand_function(
+                "addsuffix",
+                ".c,foo bar",
+                &DagNode::new("x".into(), false),
+                &vars
+            ),
+            "foo.c bar.c"
+        );
+    }
+
+    #[test]
+    fn test_expand_addprefix() {
+        let vars = HashMap::new();
+        assert_eq!(
+            expand_function(
+                "addprefix",
+                "src/,foo bar",
+                &DagNode::new("x".into(), false),
+                &vars
+            ),
+            "src/foo src/bar"
+        );
+    }
+
+    #[test]
+    fn test_expand_filter() {
+        let vars = HashMap::new();
+        assert_eq!(
+            expand_function(
+                "filter",
+                "*.c *.h,foo.c bar.h baz.o",
+                &DagNode::new("x".into(), false),
+                &vars
+            ),
+            "foo.c bar.h"
+        );
+    }
+
+    #[test]
+    fn test_expand_sort() {
+        let vars = HashMap::new();
+        assert_eq!(
+            expand_function("sort", "c b a b c", &DagNode::new("x".into(), false), &vars),
+            "a b c"
+        );
+    }
+
+    #[test]
+    fn test_expand_word() {
+        let vars = HashMap::new();
+        assert_eq!(
+            expand_function(
+                "word",
+                "2,foo bar baz",
+                &DagNode::new("x".into(), false),
+                &vars
+            ),
+            "bar"
+        );
+    }
+
+    #[test]
+    fn test_expand_words() {
+        let vars = HashMap::new();
+        assert_eq!(
+            expand_function(
+                "words",
+                "foo bar baz",
+                &DagNode::new("x".into(), false),
+                &vars
+            ),
+            "3"
+        );
+    }
+
+    #[test]
+    fn test_expand_firstword() {
+        let vars = HashMap::new();
+        assert_eq!(
+            expand_function(
+                "firstword",
+                "foo bar baz",
+                &DagNode::new("x".into(), false),
+                &vars
+            ),
+            "foo"
+        );
+    }
+
+    #[test]
+    fn test_expand_lastword() {
+        let vars = HashMap::new();
+        assert_eq!(
+            expand_function(
+                "lastword",
+                "foo bar baz",
+                &DagNode::new("x".into(), false),
+                &vars
+            ),
+            "baz"
+        );
+    }
+
+    #[test]
+    fn test_expand_strip() {
+        let vars = HashMap::new();
+        assert_eq!(
+            expand_function(
+                "strip",
+                "  foo   bar  ",
+                &DagNode::new("x".into(), false),
+                &vars
+            ),
+            "foo bar"
+        );
+    }
+
+    #[test]
+    fn test_expand_findstring() {
+        let vars = HashMap::new();
+        assert_eq!(
+            expand_function(
+                "findstring",
+                "foo,foo bar baz",
+                &DagNode::new("x".into(), false),
+                &vars
+            ),
+            "foo"
+        );
+        assert_eq!(
+            expand_function(
+                "findstring",
+                "qux,foo bar baz",
+                &DagNode::new("x".into(), false),
+                &vars
+            ),
+            ""
+        );
+    }
+
+    #[test]
+    fn test_expand_join() {
+        let vars = HashMap::new();
+        assert_eq!(
+            expand_function(
+                "join",
+                "a b c,1 2 3",
+                &DagNode::new("x".into(), false),
+                &vars
+            ),
+            "a1 b2 c3"
+        );
+    }
+
+    #[test]
+    fn test_expand_variable_lookup() {
+        let mut vars = HashMap::new();
+        vars.insert("CC".to_string(), "gcc".to_string());
+        vars.insert("CFLAGS".to_string(), "-Wall".to_string());
+        let node = DagNode::new("x".into(), false);
+        assert_eq!(expand_vars("$(CC) $(CFLAGS)", &node, &vars), "gcc -Wall");
+    }
+
+    #[test]
+    fn test_parse_variables() {
+        let content = "CC = gcc\nCFLAGS = -Wall\nall: main.o\n\t$(CC) $(CFLAGS) -o $@ $<\n";
+        let mut dag = Dag::new();
+        parse_makefile(content, &mut dag).unwrap();
+        assert_eq!(dag.variables.get("CC").map(|s| s.as_str()), Some("gcc"));
+        assert_eq!(
+            dag.variables.get("CFLAGS").map(|s| s.as_str()),
+            Some("-Wall")
+        );
     }
 
     // -- Staleness --
@@ -1139,7 +1836,7 @@ mod tests {
         node.recipes.push("echo hello".to_string());
         node.recipes.push("@echo silent".to_string());
 
-        let mut exec = Executor::new(false, true);
+        let mut exec = Executor::new(false, true, HashMap::new());
         let ok = exec.run(&[&node]);
         assert!(ok);
         assert_eq!(exec.errors, 0);
@@ -1150,7 +1847,7 @@ mod tests {
         let mut node = DagNode::new("all".to_string(), true);
         node.recipes.push("@echo silent".to_string());
 
-        let mut exec = Executor::new(false, true);
+        let mut exec = Executor::new(false, true, HashMap::new());
         let ok = exec.run(&[&node]);
         assert!(ok);
     }
