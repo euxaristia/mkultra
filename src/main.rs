@@ -325,7 +325,7 @@ fn parse_makefile(content: &str, dag: &mut Dag) -> Result<(), String> {
 
         let trimmed = raw_line.trim();
         if trimmed.is_empty() {
-            cur_tgt.clear();
+            // Empty lines don't clear cur_tgt - just skip
             i += 1;
             continue;
         }
@@ -1029,6 +1029,96 @@ mod tests {
         assert!(recipe.contains("echo yes;"));
         assert!(recipe.contains("echo no;"));
         assert!(recipe.contains("fi"));
+    }
+
+    #[test]
+    fn test_parse_backslash_continuation_multiple() {
+        let content = "all: foo\n\tcmd1 \\\n\tcmd2 \\\n\tcmd3\n";
+        let mut dag = Dag::new();
+        parse_makefile(content, &mut dag).unwrap();
+        let recipe = &dag.nodes["all"].recipes[0];
+        assert!(recipe.contains("cmd1"));
+        assert!(recipe.contains("cmd2"));
+        assert!(recipe.contains("cmd3"));
+    }
+
+    #[test]
+    fn test_parse_backslash_continuation_then_empty_line() {
+        let content = "all: foo\n\tcmd1 \\\n\tcmd2\n\nother:\n\techo other\n";
+        let mut dag = Dag::new();
+        parse_makefile(content, &mut dag).unwrap();
+        assert_eq!(dag.nodes["all"].recipes.len(), 1);
+        assert!(dag.nodes["all"].recipes[0].contains("cmd1"));
+        assert!(dag.nodes["all"].recipes[0].contains("cmd2"));
+        assert_eq!(dag.nodes["other"].recipes.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_single_recipe_no_continuation() {
+        let content = "all: foo\n\techo single line\n";
+        let mut dag = Dag::new();
+        parse_makefile(content, &mut dag).unwrap();
+        assert_eq!(dag.nodes["all"].recipes.len(), 1);
+        assert_eq!(dag.nodes["all"].recipes[0], "echo single line");
+    }
+
+    #[test]
+    fn test_parse_multiple_recipes_no_continuation() {
+        let content = "all: foo\n\techo line1\n\techo line2\n\techo line3\n";
+        let mut dag = Dag::new();
+        parse_makefile(content, &mut dag).unwrap();
+        assert_eq!(dag.nodes["all"].recipes.len(), 3);
+    }
+
+    #[test]
+    fn test_parse_continuation_then_new_recipe() {
+        let content = "all: foo\n\tcmd1 \\\n\tcmd2\n\tcmd3\n";
+        let mut dag = Dag::new();
+        parse_makefile(content, &mut dag).unwrap();
+        assert_eq!(dag.nodes["all"].recipes.len(), 2);
+        assert!(dag.nodes["all"].recipes[0].contains("cmd1"));
+        assert!(dag.nodes["all"].recipes[0].contains("cmd2"));
+        assert_eq!(dag.nodes["all"].recipes[1], "cmd3");
+    }
+
+    #[test]
+    fn test_parse_continuation_preserves_spaces() {
+        let content = "all: foo\n\t@echo   spaces   here \\\n\t     more spaces\n";
+        let mut dag = Dag::new();
+        parse_makefile(content, &mut dag).unwrap();
+        let recipe = &dag.nodes["all"].recipes[0];
+        assert!(recipe.contains("spaces"));
+    }
+
+    #[test]
+    fn test_parse_empty_lines_dont_break_recipes() {
+        let content = "all: foo\n\techo start\n\n\techo middle\n\techo end\n";
+        let mut dag = Dag::new();
+        parse_makefile(content, &mut dag).unwrap();
+        // Each tab-indented line is a separate recipe
+        assert_eq!(dag.nodes["all"].recipes.len(), 3);
+        assert_eq!(dag.nodes["all"].recipes[0], "echo start");
+        assert_eq!(dag.nodes["all"].recipes[1], "echo middle");
+        assert_eq!(dag.nodes["all"].recipes[2], "echo end");
+    }
+
+    #[test]
+    fn test_parse_makefile_real_world_style() {
+        let content = "\
+CC = gcc
+CFLAGS = -Wall -O2
+
+all: app
+
+app: main.o utils.o
+\t$(CC) $(CFLAGS) -o $@ $^\n\
+\nclean:\n\trm -f app *.o\n\n.PHONY: all clean\n";
+        let mut dag = Dag::new();
+        parse_makefile(content, &mut dag).unwrap();
+        assert_eq!(dag.variables.get("CC").map(|s| s.as_str()), Some("gcc"));
+        assert!(dag.nodes.contains_key("all"));
+        assert!(dag.nodes.contains_key("clean"));
+        assert!(dag.nodes["clean"].is_phony);
     }
 
     // -- Automatic variable expansion --
