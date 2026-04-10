@@ -524,7 +524,9 @@ fn expand_vars_simple(text: &str, variables: &HashMap<String, String>) -> String
                 }
             } else if next.is_alphanumeric() || next == '_' {
                 if let Some((name, consumed)) = parse_simple_var(&chars, i + 1) {
-                    out.push_str(variables.get(&name).cloned().unwrap_or_default().as_str());
+                    // Recursively expand the looked-up value
+                    let raw = variables.get(&name).cloned().unwrap_or_default();
+                    out.push_str(&expand_vars_simple(&raw, variables));
                     i += consumed;
                 } else {
                     out.push(chars[i]);
@@ -579,8 +581,8 @@ fn expand_vars(cmd: &str, node: &DagNode, variables: &HashMap<String, String>) -
 
             if next.is_alphanumeric() || next == '_' {
                 if let Some((name, consumed)) = parse_simple_var(&chars, i + 1) {
-                    let expanded = variables.get(&name).cloned().unwrap_or_default();
-                    out.push_str(&expanded);
+                    let raw = variables.get(&name).cloned().unwrap_or_default();
+                    out.push_str(&expand_vars_simple(&raw, variables));
                     i += consumed;
                     continue;
                 }
@@ -650,7 +652,10 @@ fn expand_function(
     match name {
         "wildcard" => expand_wildcard(args),
         "shell" => expand_shell(args),
-        _ => variables.get(name).cloned().unwrap_or_default(),
+        _ => expand_vars_simple(
+            &variables.get(name).cloned().unwrap_or_default(),
+            variables,
+        ),
     }
 }
 
@@ -840,6 +845,12 @@ fn main() -> ExitCode {
 
     // Parse
     let mut dag = Dag::new();
+
+    // Import environment variables into the variable table (like GNU make does)
+    for (k, v) in env::vars() {
+        dag.set_variable(&k, v);
+    }
+
     if let Err(e) = parse_makefile(&content, &mut dag) {
         eprintln!("mkultra: {e}");
         return ExitCode::from(2);
@@ -1044,7 +1055,7 @@ mod tests {
 
     #[test]
     fn test_parse_args_r() {
-        let args = parse_args_vec(&["-r"]).unwrap();
+        let _args = parse_args_vec(&["-r"]).unwrap();
         // -r is a no-op, just testing it doesn't error
     }
 
@@ -1497,8 +1508,8 @@ app: main.o utils.o
         let content = "A = foo\nB = $(A)\nall: $(B)\n";
         let mut dag = Dag::new();
         parse_makefile(content, &mut dag).unwrap();
-        // Note: nested expansion happens at parse time, not recursive
-        assert_eq!(dag.nodes["all"].prereqs, vec!["$(A)"]);
+        // Recursive expansion: $(B) -> $(A) -> foo
+        assert_eq!(dag.nodes["all"].prereqs, vec!["foo"]);
     }
 
     #[test]
