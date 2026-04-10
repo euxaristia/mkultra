@@ -580,16 +580,22 @@ impl Executor {
     }
 
     fn run(&mut self, nodes: &[&DagNode]) -> bool {
+        let mut built_something = false;
         for nd in nodes {
             if !nd.needs_rebuild() {
-                println!("mkultra: '{}' is up to date.", nd.target);
                 continue;
             }
             if nd.recipes.is_empty() {
                 continue;
             }
+            built_something = true;
             if !self.exec_node(nd) && !self.keep_going {
                 return false;
+            }
+        }
+        if !built_something {
+            if let Some(first) = nodes.first() {
+                println!("mkultra: nothing to be done for '{}'", first.target);
             }
         }
         self.errors == 0
