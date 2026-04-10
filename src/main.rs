@@ -1061,6 +1061,59 @@ mod tests {
     }
 
     #[test]
+    fn test_expand_multiple_vars() {
+        let mut vars = HashMap::new();
+        vars.insert("A".to_string(), "1".to_string());
+        vars.insert("B".to_string(), "2".to_string());
+        vars.insert("C".to_string(), "3".to_string());
+        let node = DagNode::new("x".into(), false);
+        assert_eq!(expand_vars("$(A) $(B) $(C)", &node, &vars), "1 2 3");
+    }
+
+    #[test]
+    fn test_expand_var_in_var() {
+        let mut vars = HashMap::new();
+        vars.insert("A".to_string(), "B".to_string());
+        vars.insert("B".to_string(), "value".to_string());
+        let node = DagNode::new("x".into(), false);
+        assert_eq!(expand_vars("$(A)", &node, &vars), "B");
+    }
+
+    #[test]
+    fn test_expand_var_with_special_chars() {
+        let mut vars = HashMap::new();
+        vars.insert("FLAGS".to_string(), "-Wall -O2".to_string());
+        let node = DagNode::new("x".into(), false);
+        assert_eq!(expand_vars("gcc $(FLAGS)", &node, &vars), "gcc -Wall -O2");
+    }
+
+    #[test]
+    fn test_expand_wildcard_no_pattern() {
+        let node = DagNode::new("x".into(), false);
+        let vars = HashMap::new();
+        assert_eq!(
+            expand_function("wildcard", "Makefile", &node, &vars),
+            "Makefile"
+        );
+    }
+
+    #[test]
+    fn test_expand_shell() {
+        let node = DagNode::new("x".into(), false);
+        let vars = HashMap::new();
+        let result = expand_function("shell", "echo hello", &node, &vars);
+        assert_eq!(result, "hello");
+    }
+
+    #[test]
+    fn test_expand_shell_with_args() {
+        let node = DagNode::new("x".into(), false);
+        let vars = HashMap::new();
+        let result = expand_function("shell", "echo 1 2 3", &node, &vars);
+        assert_eq!(result, "1 2 3");
+    }
+
+    #[test]
     fn test_parse_variables() {
         let content = "CC = gcc\nCFLAGS = -Wall\nall: main.o\n\t$(CC) $(CFLAGS) -o $@ $<\n";
         let mut dag = Dag::new();
@@ -1070,6 +1123,49 @@ mod tests {
             dag.variables.get("CFLAGS").map(|s| s.as_str()),
             Some("-Wall")
         );
+    }
+
+    #[test]
+    fn test_parse_variables_with_auto_vars() {
+        let content = "CC = gcc\nall: main.o\n\t$(CC) -o $@ $<\n";
+        let mut dag = Dag::new();
+        parse_makefile(content, &mut dag).unwrap();
+        let node = &dag.nodes["all"];
+        assert_eq!(node.recipes.len(), 1);
+        assert_eq!(node.prereqs, vec!["main.o"]);
+    }
+
+    #[test]
+    fn test_parse_real_world_makefile() {
+        let content = "\
+CC = gcc
+CFLAGS = -Wall -O2
+TARGET = app
+
+all: $(TARGET)
+
+$(TARGET): main.o utils.o
+\t$(CC) $(CFLAGS) -o $@ $^
+
+main.o: main.c
+\t$(CC) $(CFLAGS) -c $< -o $@
+
+utils.o: utils.c
+\t$(CC) $(CFLAGS) -c $< -o $@
+
+clean:
+\trm -f $(TARGET) *.o
+";
+        let mut dag = Dag::new();
+        parse_makefile(content, &mut dag).unwrap();
+        assert_eq!(dag.variables.get("CC").map(|s| s.as_str()), Some("gcc"));
+        assert_eq!(
+            dag.variables.get("CFLAGS").map(|s| s.as_str()),
+            Some("-Wall -O2")
+        );
+        assert!(dag.nodes.contains_key("all"));
+        assert!(dag.nodes.contains_key("clean"));
+        assert_eq!(dag.nodes["$(TARGET)"].prereqs, vec!["main.o", "utils.o"]);
     }
 
     // -- Staleness --
