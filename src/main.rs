@@ -291,23 +291,46 @@ impl Dag {
 fn parse_makefile(content: &str, dag: &mut Dag) -> Result<(), String> {
     let mut cur_tgt = String::new();
     let mut phony_targets: Vec<String> = Vec::new();
+    let mut pending_recipe: Option<String> = None;
 
-    for raw_line in content.lines() {
+    let lines: Vec<&str> = content.lines().collect();
+    let mut i = 0;
+    while i < lines.len() {
+        let raw_line = lines[i];
+
         // Recipe lines start with a tab
         if raw_line.starts_with('\t') {
             let trimmed = raw_line.trim();
             if !trimmed.is_empty() && !cur_tgt.is_empty() {
-                dag.add_recipe(&cur_tgt, trimmed);
+                // Handle backslash continuation
+                if trimmed.ends_with('\\') {
+                    let cmd = trimmed.strip_suffix('\\').unwrap_or(trimmed).to_string();
+                    pending_recipe = Some(pending_recipe.take().unwrap_or_default() + &cmd + "\n");
+                } else {
+                    let cmd = pending_recipe.take().unwrap_or_default() + trimmed;
+                    dag.add_recipe(&cur_tgt, &cmd);
+                    pending_recipe = None;
+                }
             }
+            i += 1;
             continue;
+        }
+
+        // Flush any pending recipe before processing non-recipe line
+        if let Some(cmd) = pending_recipe.take() {
+            if !cur_tgt.is_empty() && !cmd.trim().is_empty() {
+                dag.add_recipe(&cur_tgt, cmd.trim());
+            }
         }
 
         let trimmed = raw_line.trim();
         if trimmed.is_empty() {
             cur_tgt.clear();
+            i += 1;
             continue;
         }
         if trimmed.starts_with('#') {
+            i += 1;
             continue;
         }
 
@@ -318,6 +341,7 @@ fn parse_makefile(content: &str, dag: &mut Dag) -> Result<(), String> {
             if !lhs.is_empty() && !lhs.contains(' ') && !lhs.contains('=') {
                 dag.set_variable(lhs, rhs.to_string());
                 cur_tgt.clear();
+                i += 1;
                 continue;
             }
         }
@@ -328,6 +352,7 @@ fn parse_makefile(content: &str, dag: &mut Dag) -> Result<(), String> {
             let after_colon = &trimmed[colon_pos + 1..];
             if after_colon.starts_with('=') {
                 cur_tgt.clear();
+                i += 1;
                 continue;
             }
 
@@ -356,6 +381,14 @@ fn parse_makefile(content: &str, dag: &mut Dag) -> Result<(), String> {
                     dag.add_prereq(target_part, prereq);
                 }
             }
+        }
+        i += 1;
+    }
+
+    // Flush any pending recipe at end of file
+    if let Some(cmd) = pending_recipe.take() {
+        if !cur_tgt.is_empty() && !cmd.trim().is_empty() {
+            dag.add_recipe(&cur_tgt, cmd.trim());
         }
     }
 
@@ -984,6 +1017,18 @@ mod tests {
         let mut dag = Dag::new();
         parse_makefile(content, &mut dag).unwrap();
         assert!(dag.nodes["all"].recipes.is_empty());
+    }
+
+    #[test]
+    fn test_parse_backslash_continuation() {
+        let content = "all: foo\n\t@if [ -f foo ]; then \\\n\t\techo yes; \\\n\telse \\\n\t\techo no; \\\n\tfi\n";
+        let mut dag = Dag::new();
+        parse_makefile(content, &mut dag).unwrap();
+        let recipe = &dag.nodes["all"].recipes[0];
+        assert!(recipe.contains("if [ -f foo ]; then"));
+        assert!(recipe.contains("echo yes;"));
+        assert!(recipe.contains("echo no;"));
+        assert!(recipe.contains("fi"));
     }
 
     // -- Automatic variable expansion --
