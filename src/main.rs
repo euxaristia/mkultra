@@ -22,6 +22,7 @@ struct CliArgs {
     keep_going: bool,
     dry_run: bool,
     help: bool,
+    version: bool,
 }
 
 fn parse_args() -> Result<CliArgs, String> {
@@ -47,6 +48,7 @@ fn parse_args() -> Result<CliArgs, String> {
             "-k" => args.keep_going = true,
             "-n" => args.dry_run = true,
             "-h" | "--help" => args.help = true,
+            "--version" => args.version = true,
             s if s.starts_with('-') => return Err(format!("unknown option: {s}")),
             s => args.target = Some(s.to_string()),
         }
@@ -729,6 +731,11 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
+    if args.version {
+        println!("mkultra 0.1.0");
+        return ExitCode::SUCCESS;
+    }
+
     // Resolve makefile
     let makefile = match &args.makefile {
         Some(f) => f.clone(),
@@ -877,6 +884,12 @@ mod tests {
         assert!(args.help);
     }
 
+    #[test]
+    fn test_parse_args_version() {
+        let args = parse_args_vec(&["--version"]).unwrap();
+        assert!(args.version);
+    }
+
     /// Helper that parses a slice of &str as if they were CLI args
     fn parse_args_vec(args: &[&str]) -> Result<CliArgs, String> {
         let mut result = CliArgs::default();
@@ -900,6 +913,7 @@ mod tests {
                 "-k" => result.keep_going = true,
                 "-n" => result.dry_run = true,
                 "-h" | "--help" => result.help = true,
+                "--version" => result.version = true,
                 s if s.starts_with('-') => return Err(format!("unknown option: {s}")),
                 s => result.target = Some(s.to_string()),
             }
