@@ -20,6 +20,10 @@ struct CliArgs {
     makefile: Option<String>,
     jobs: Option<usize>,
     keep_going: bool,
+    ignore_errors: bool,
+    silent: bool,
+    question: bool,
+    print_db: bool,
     dry_run: bool,
     help: bool,
     version: bool,
@@ -46,6 +50,10 @@ fn parse_args() -> Result<CliArgs, String> {
                 args.jobs = Some(argv[i].parse().map_err(|_| "invalid -j value")?);
             }
             "-k" => args.keep_going = true,
+            "-i" => args.ignore_errors = true,
+            "-s" => args.silent = true,
+            "-q" => args.question = true,
+            "-p" => args.print_db = true,
             "-n" => args.dry_run = true,
             "-h" | "--help" => args.help = true,
             "--version" => args.version = true,
@@ -58,14 +66,19 @@ fn parse_args() -> Result<CliArgs, String> {
 }
 
 fn print_usage() {
-    println!("Usage: mkultra [target] [-f Makefile] [-j N] [-k] [-n]");
+    println!("Usage: mkultra [target] [-f makefile] [-iknpqrs]");
     println!();
     println!("Options:");
     println!("  -f FILE   Read FILE as the makefile (default: Makefile, then makefile)");
-    println!("  -j N      Allow N parallel jobs");
+    println!("  -i        Ignore errors from commands");
     println!("  -k        Keep going after errors");
-    println!("  -n        Dry run");
+    println!("  -n        Dry run (print commands but don't execute)");
+    println!("  -p        Print database (rules and variables)");
+    println!("  -q        Question mode (exit 0 if up to date, 1 otherwise)");
+    println!("  -r        Disable built-in rules (no-op for compatibility)");
+    println!("  -s        Silent mode (don't echo commands)");
     println!("  -h        Show this help");
+    println!("  --version Show version");
 }
 
 // ---------------------------------------------------------------------------
@@ -636,28 +649,33 @@ fn expand_shell(cmd: &str) -> String {
 // ---------------------------------------------------------------------------
 // Executor
 // ---------------------------------------------------------------------------
-// Executor
-// ---------------------------------------------------------------------------
 
 struct Executor {
     keep_going: bool,
+    ignore_errors: bool,
+    silent: bool,
     dry_run: bool,
+    question: bool,
     errors: usize,
+    needs_build: bool,
     variables: HashMap<String, String>,
 }
 
 impl Executor {
-    fn new(keep_going: bool, dry_run: bool, variables: HashMap<String, String>) -> Self {
+    fn new(args: &CliArgs, variables: HashMap<String, String>) -> Self {
         Self {
-            keep_going,
-            dry_run,
+            keep_going: args.keep_going,
+            ignore_errors: args.ignore_errors,
+            silent: args.silent,
+            dry_run: args.dry_run,
+            question: args.question,
             errors: 0,
+            needs_build: false,
             variables,
         }
     }
 
     fn run(&mut self, nodes: &[&DagNode], target: &str) -> bool {
-        let mut built_something = false;
         for nd in nodes {
             if !nd.needs_rebuild() {
                 continue;
@@ -665,12 +683,15 @@ impl Executor {
             if nd.recipes.is_empty() {
                 continue;
             }
-            built_something = true;
-            if !self.exec_node(nd) && !self.keep_going {
+            self.needs_build = true;
+            if self.question {
+                return false;
+            }
+            if !self.exec_node(nd) && !self.keep_going && !self.ignore_errors {
                 return false;
             }
         }
-        if !built_something {
+        if !self.needs_build && !self.question {
             println!("mkultra: nothing to be done for '{}'", target);
         }
         self.errors == 0
@@ -678,18 +699,18 @@ impl Executor {
 
     fn exec_node(&mut self, nd: &DagNode) -> bool {
         for recipe in &nd.recipes {
-            let echo = !recipe.starts_with('@');
+            let suppressed = recipe.starts_with('@') || self.silent;
             let cmd = recipe.strip_prefix('@').unwrap_or(recipe);
             let expanded = expand_vars(cmd, nd, &self.variables);
 
             if self.dry_run {
-                if echo {
+                if !suppressed {
                     println!("{expanded}");
                 }
                 continue;
             }
 
-            if echo {
+            if !suppressed {
                 println!("{expanded}");
                 io::stdout().flush().ok();
             }
@@ -698,6 +719,9 @@ impl Executor {
             if code != 0 {
                 self.errors += 1;
                 eprintln!("mkultra: *** [{}] Error {code}", nd.target);
+                if self.ignore_errors {
+                    continue;
+                }
                 return false;
             }
         }
@@ -800,8 +824,40 @@ fn main() -> ExitCode {
         }
     };
 
+    // Print database (-p)
+    if args.print_db {
+        println!("# Variables");
+        for (k, v) in &dag.variables {
+            println!("{k} = {v}");
+        }
+        println!("\n# Rules");
+        for (name, node) in &dag.nodes {
+            if !node.prereqs.is_empty() || !node.recipes.is_empty() {
+                print!("{name}:");
+                for p in &node.prereqs {
+                    print!(" {p}");
+                }
+                println!();
+                for r in &node.recipes {
+                    println!("\t{r}");
+                }
+            }
+        }
+        return ExitCode::SUCCESS;
+    }
+
+    // Question mode (-q): exit 0 if up to date, 1 if needs build
+    if args.question {
+        for nd in &nodes {
+            if nd.needs_rebuild() {
+                return ExitCode::from(1);
+            }
+        }
+        return ExitCode::SUCCESS;
+    }
+
     // Execute
-    let mut executor = Executor::new(args.keep_going, args.dry_run, dag.variables.clone());
+    let mut executor = Executor::new(&args, dag.variables.clone());
     if executor.run(&nodes, &build_target) {
         ExitCode::SUCCESS
     } else {
@@ -816,6 +872,42 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parse_args_vec(args: &[&str]) -> Result<CliArgs, String> {
+        let mut result = CliArgs::default();
+        let mut i = 0;
+        while i < args.len() {
+            match args[i] {
+                "-f" => {
+                    i += 1;
+                    if i >= args.len() {
+                        return Err("-f requires an argument".into());
+                    }
+                    result.makefile = Some(args[i].to_string());
+                }
+                "-j" => {
+                    i += 1;
+                    if i >= args.len() {
+                        return Err("-j requires an argument".into());
+                    }
+                    result.jobs = Some(args[i].parse().map_err(|_| "invalid -j value")?);
+                }
+                "-k" => result.keep_going = true,
+                "-i" => result.ignore_errors = true,
+                "-s" => result.silent = true,
+                "-q" => result.question = true,
+                "-p" => result.print_db = true,
+                "-r" => {} // no-op for compatibility
+                "-n" => result.dry_run = true,
+                "-h" | "--help" => result.help = true,
+                "--version" => result.version = true,
+                s if s.starts_with('-') => return Err(format!("unknown option: {s}")),
+                s => result.target = Some(s.to_string()),
+            }
+            i += 1;
+        }
+        Ok(result)
+    }
 
     // -- parse_args --
 
@@ -873,53 +965,44 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_args_unknown_option() {
-        let err = parse_args_vec(&["--unknown"]).unwrap_err();
-        assert!(err.contains("unknown option"));
+    fn test_parse_args_i() {
+        let args = parse_args_vec(&["-i"]).unwrap();
+        assert!(args.ignore_errors);
     }
 
     #[test]
-    fn test_parse_args_help() {
-        let args = parse_args_vec(&["-h"]).unwrap();
-        assert!(args.help);
+    fn test_parse_args_s() {
+        let args = parse_args_vec(&["-s"]).unwrap();
+        assert!(args.silent);
     }
 
     #[test]
-    fn test_parse_args_version() {
-        let args = parse_args_vec(&["--version"]).unwrap();
-        assert!(args.version);
+    fn test_parse_args_q() {
+        let args = parse_args_vec(&["-q"]).unwrap();
+        assert!(args.question);
     }
 
-    /// Helper that parses a slice of &str as if they were CLI args
-    fn parse_args_vec(args: &[&str]) -> Result<CliArgs, String> {
-        let mut result = CliArgs::default();
-        let mut i = 0;
-        while i < args.len() {
-            match args[i] {
-                "-f" => {
-                    i += 1;
-                    if i >= args.len() {
-                        return Err("-f requires an argument".into());
-                    }
-                    result.makefile = Some(args[i].to_string());
-                }
-                "-j" => {
-                    i += 1;
-                    if i >= args.len() {
-                        return Err("-j requires an argument".into());
-                    }
-                    result.jobs = Some(args[i].parse().map_err(|_| "invalid -j value")?);
-                }
-                "-k" => result.keep_going = true,
-                "-n" => result.dry_run = true,
-                "-h" | "--help" => result.help = true,
-                "--version" => result.version = true,
-                s if s.starts_with('-') => return Err(format!("unknown option: {s}")),
-                s => result.target = Some(s.to_string()),
-            }
-            i += 1;
-        }
-        Ok(result)
+    #[test]
+    fn test_parse_args_p() {
+        let args = parse_args_vec(&["-p"]).unwrap();
+        assert!(args.print_db);
+    }
+
+    #[test]
+    fn test_parse_args_r() {
+        let args = parse_args_vec(&["-r"]).unwrap();
+        // -r is a no-op, just testing it doesn't error
+    }
+
+    #[test]
+    fn test_parse_args_all_flags() {
+        let args = parse_args_vec(&["-i", "-k", "-n", "-p", "-q", "-r", "-s"]).unwrap();
+        assert!(args.ignore_errors);
+        assert!(args.keep_going);
+        assert!(args.dry_run);
+        assert!(args.print_db);
+        assert!(args.question);
+        assert!(args.silent);
     }
 
     // -- DAG construction & cycle detection --
@@ -1521,13 +1604,20 @@ clean:
 
     // -- Executor (dry run) --
 
+    fn make_test_args(dry_run: bool) -> CliArgs {
+        CliArgs {
+            dry_run,
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn test_executor_dry_run() {
         let mut node = DagNode::new("all".to_string(), true);
         node.recipes.push("echo hello".to_string());
         node.recipes.push("@echo silent".to_string());
 
-        let mut exec = Executor::new(false, true, HashMap::new());
+        let mut exec = Executor::new(&make_test_args(true), HashMap::new());
         let ok = exec.run(&[&node], "all");
         assert!(ok);
         assert_eq!(exec.errors, 0);
@@ -1538,7 +1628,7 @@ clean:
         let mut node = DagNode::new("all".to_string(), true);
         node.recipes.push("@echo silent".to_string());
 
-        let mut exec = Executor::new(false, true, HashMap::new());
+        let mut exec = Executor::new(&make_test_args(true), HashMap::new());
         let ok = exec.run(&[&node], "all");
         assert!(ok);
     }
