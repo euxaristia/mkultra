@@ -74,8 +74,10 @@ fn print_usage() {
 struct DagNode {
     target: String,
     prereqs: Vec<String>,
+    order_prereqs: Vec<String>,
     recipes: Vec<String>,
     is_phony: bool,
+    stem: Option<String>,
 }
 
 impl DagNode {
@@ -83,8 +85,10 @@ impl DagNode {
         Self {
             target,
             prereqs: Vec::new(),
+            order_prereqs: Vec::new(),
             recipes: Vec::new(),
             is_phony,
+            stem: None,
         }
     }
 
@@ -104,6 +108,29 @@ impl DagNode {
             }
         }
         false
+    }
+
+    /// Returns prerequisites newer than the target (for $?).
+    fn newer_prereqs(&self) -> Vec<&str> {
+        let target_mtime = file_mtime(&self.target);
+        self.prereqs
+            .iter()
+            .filter(|p| {
+                let mtime = file_mtime(p);
+                mtime > target_mtime
+            })
+            .map(|s| s.as_str())
+            .collect()
+    }
+
+    /// Returns the directory part of a path, or "." if none.
+    fn dir_part(path: &str) -> &str {
+        path.rsplit_once('/').map(|(d, _)| d).unwrap_or(".")
+    }
+
+    /// Returns the file part of a path (everything after last /).
+    fn file_part(path: &str) -> &str {
+        path.rsplit_once('/').map(|(_, f)| f).unwrap_or(path)
     }
 }
 
@@ -146,13 +173,32 @@ impl Dag {
             .prereqs
             .push(prereq.to_string());
         self.ensure_node(prereq, false);
-        // If this is the first non-dot target, set as default
         if self.default_target.is_none()
             && !target.starts_with('.')
             && target != ".PHONY"
             && target != ".SUFFIXES"
         {
             self.set_default(target);
+        }
+    }
+
+    fn add_order_prereq(&mut self, target: &str, prereq: &str) {
+        self.ensure_node(target, false)
+            .order_prereqs
+            .push(prereq.to_string());
+        self.ensure_node(prereq, false);
+        if self.default_target.is_none()
+            && !target.starts_with('.')
+            && target != ".PHONY"
+            && target != ".SUFFIXES"
+        {
+            self.set_default(target);
+        }
+    }
+
+    fn set_stem(&mut self, target: &str, stem: Option<String>) {
+        if let Some(node) = self.nodes.get_mut(target) {
+            node.stem = stem;
         }
     }
 
@@ -338,8 +384,18 @@ fn parse_makefile(content: &str, dag: &mut Dag) -> Result<(), String> {
 
             let prereqs_part = after_colon.trim();
             if !prereqs_part.is_empty() && target_part != ".PHONY" {
-                for prereq in prereqs_part.split_whitespace() {
-                    dag.add_prereq(target_part, prereq);
+                let prereqs: Vec<&str> = prereqs_part.split_whitespace().collect();
+                let mut seen_bar = false;
+                for prereq in prereqs {
+                    if prereq == "|" {
+                        seen_bar = true;
+                        continue;
+                    }
+                    if seen_bar {
+                        dag.add_order_prereq(target_part, prereq);
+                    } else {
+                        dag.add_prereq(target_part, prereq);
+                    }
                 }
             }
         }
@@ -359,51 +415,147 @@ fn parse_makefile(content: &str, dag: &mut Dag) -> Result<(), String> {
 // Automatic variable expansion
 // ---------------------------------------------------------------------------
 
+enum AutoVar {
+    Target,
+    FirstPrereq,
+    AllPrereqs,
+    AllPrereqsDups,
+    NewerPrereqs,
+    Stem,
+    OrderOnly,
+}
+
+impl AutoVar {
+    fn from_char(c: char) -> Option<Self> {
+        match c {
+            '@' => Some(Self::Target),
+            '<' => Some(Self::FirstPrereq),
+            '^' => Some(Self::AllPrereqs),
+            '+' => Some(Self::AllPrereqsDups),
+            '?' => Some(Self::NewerPrereqs),
+            '*' => Some(Self::Stem),
+            '|' => Some(Self::OrderOnly),
+            _ => None,
+        }
+    }
+
+    fn expand(&self, node: &DagNode) -> String {
+        match self {
+            Self::Target => node.target.clone(),
+            Self::FirstPrereq => node.prereqs.first().cloned().unwrap_or_default(),
+            Self::AllPrereqs => node.prereqs.join(" "),
+            Self::AllPrereqsDups => node.prereqs.join(" "),
+            Self::NewerPrereqs => node
+                .newer_prereqs()
+                .into_iter()
+                .collect::<Vec<_>>()
+                .join(" "),
+            Self::Stem => node.stem.clone().unwrap_or_default(),
+            Self::OrderOnly => node.order_prereqs.join(" "),
+        }
+    }
+
+    fn dir_part(&self, node: &DagNode) -> String {
+        let path = self.expand(node);
+        if path.is_empty() {
+            String::new()
+        } else {
+            DagNode::dir_part(&path).to_string()
+        }
+    }
+
+    fn file_part(&self, node: &DagNode) -> String {
+        let path = self.expand(node);
+        if path.is_empty() {
+            String::new()
+        } else {
+            DagNode::file_part(&path).to_string()
+        }
+    }
+}
+
 fn expand_auto_vars(cmd: &str, node: &DagNode) -> String {
     let mut out = String::new();
     let chars: Vec<char> = cmd.chars().collect();
     let mut i = 0;
     while i < chars.len() {
         if chars[i] == '$' {
-            if i + 1 < chars.len() {
-                match chars[i + 1] {
-                    '@' => {
-                        out.push_str(&node.target);
-                        i += 2;
-                    }
-                    '<' => {
-                        if let Some(first) = node.prereqs.first() {
-                            out.push_str(first);
-                        }
-                        i += 2;
-                    }
-                    '^' => {
-                        out.push_str(&node.prereqs.join(" "));
-                        i += 2;
-                    }
-                    '*' => {
-                        // Stem — not fully implemented, skip for now
-                        i += 2;
-                    }
-                    '$' => {
-                        out.push('$');
-                        i += 2;
-                    }
-                    _ => {
-                        out.push('$');
-                        i += 1;
-                    }
-                }
-            } else {
+            if i + 1 >= chars.len() {
                 out.push('$');
                 i += 1;
+                continue;
             }
+
+            let next = chars[i + 1];
+
+            if next == '$' {
+                out.push('$');
+                i += 2;
+                continue;
+            }
+
+            if next == '(' {
+                if let Some((var, consumed)) = parse_parenthesized_var(&chars, i + 1) {
+                    match var.as_str() {
+                        "@D" => out.push_str(&AutoVar::Target.dir_part(node)),
+                        "@F" => out.push_str(&AutoVar::Target.file_part(node)),
+                        "<D" => out.push_str(&AutoVar::FirstPrereq.dir_part(node)),
+                        "<F" => out.push_str(&AutoVar::FirstPrereq.file_part(node)),
+                        "^D" => out.push_str(&AutoVar::AllPrereqs.dir_part(node)),
+                        "^F" => out.push_str(&AutoVar::AllPrereqs.file_part(node)),
+                        "+D" => out.push_str(&AutoVar::AllPrereqsDups.dir_part(node)),
+                        "+F" => out.push_str(&AutoVar::AllPrereqsDups.file_part(node)),
+                        "?D" => out.push_str(&AutoVar::NewerPrereqs.dir_part(node)),
+                        "?F" => out.push_str(&AutoVar::NewerPrereqs.file_part(node)),
+                        "*D" => out.push_str(&AutoVar::Stem.dir_part(node)),
+                        "*F" => out.push_str(&AutoVar::Stem.file_part(node)),
+                        "|D" => out.push_str(&AutoVar::OrderOnly.dir_part(node)),
+                        "|F" => out.push_str(&AutoVar::OrderOnly.file_part(node)),
+                        _ => {
+                            out.push('$');
+                            out.push('(');
+                            out.push_str(&var);
+                            out.push(')');
+                        }
+                    }
+                    i += consumed;
+                    continue;
+                }
+            }
+
+            if let Some(var) = AutoVar::from_char(next) {
+                out.push_str(&var.expand(node));
+                i += 2;
+                continue;
+            }
+
+            out.push('$');
+            i += 1;
         } else {
             out.push(chars[i]);
             i += 1;
         }
     }
     out
+}
+
+fn parse_parenthesized_var(chars: &[char], start: usize) -> Option<(String, usize)> {
+    let mut depth = 1;
+    let mut i = start + 1;
+    while i < chars.len() && depth > 0 {
+        match chars[i] {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    if depth == 0 {
+        let var_name: String = chars[start + 1..i - 1].iter().collect();
+        Some((var_name, i - start + 1))
+    } else {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -791,6 +943,16 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_order_only_prereqs() {
+        let content = "all: out1 out2 | dir1 dir2\n\techo done\n";
+        let mut dag = Dag::new();
+        parse_makefile(content, &mut dag).unwrap();
+        let node = &dag.nodes["all"];
+        assert_eq!(node.prereqs, vec!["out1", "out2"]);
+        assert_eq!(node.order_prereqs, vec!["dir1", "dir2"]);
+    }
+
+    #[test]
     fn test_parse_comments_skipped() {
         let content = "# this is a comment\nall: output\n\techo\n";
         let mut dag = Dag::new();
@@ -869,16 +1031,83 @@ mod tests {
     #[test]
     fn test_expand_unknown_var_passes_through() {
         let node = DagNode::new("x".to_string(), false);
-        // $* (stem) is not implemented, should be consumed without output
+        // $* (stem) is now implemented, should return empty when no stem set
         assert_eq!(expand_auto_vars("$*", &node), "");
-        // $? is unknown, should pass through literally as $
-        assert_eq!(expand_auto_vars("$?", &node), "$?");
+        // $? is now implemented
+        assert_eq!(expand_auto_vars("$?", &node), "");
+        // $| is now implemented
+        assert_eq!(expand_auto_vars("$|", &node), "");
+        // unknown vars should pass through
+        assert_eq!(expand_auto_vars("$X", &node), "$X");
+        assert_eq!(expand_auto_vars("$(XXX)", &node), "$(XXX)");
+    }
+
+    #[test]
+    fn test_expand_dollar_plus() {
+        let mut node = DagNode::new("out".to_string(), false);
+        node.prereqs.push("a.o".to_string());
+        node.prereqs.push("b.o".to_string());
+        node.prereqs.push("a.o".to_string());
+        assert_eq!(expand_auto_vars("$+", &node), "a.o b.o a.o");
+    }
+
+    #[test]
+    fn test_expand_stem() {
+        let mut node = DagNode::new("foo.bar".to_string(), false);
+        node.stem = Some("foo".to_string());
+        assert_eq!(expand_auto_vars("$*", &node), "foo");
+        assert_eq!(expand_auto_vars("file: $*", &node), "file: foo");
+    }
+
+    #[test]
+    fn test_expand_order_prereqs() {
+        let mut node = DagNode::new("out".to_string(), false);
+        node.prereqs.push("normal.o".to_string());
+        node.order_prereqs.push("dir".to_string());
+        assert_eq!(expand_auto_vars("$|", &node), "dir");
+    }
+
+    #[test]
+    fn test_expand_dir_file_parts() {
+        let mut node = DagNode::new("src/foo/bar.o".to_string(), false);
+        node.prereqs.push("src/foo/bar.c".to_string());
+        node.stem = Some("src/foo/bar".to_string());
+
+        assert_eq!(expand_auto_vars("$(@D)", &node), "src/foo");
+        assert_eq!(expand_auto_vars("$(@F)", &node), "bar.o");
+        assert_eq!(expand_auto_vars("$(<D)", &node), "src/foo");
+        assert_eq!(expand_auto_vars("$(<F)", &node), "bar.c");
+        assert_eq!(expand_auto_vars("$(*D)", &node), "src/foo");
+        assert_eq!(expand_auto_vars("$(*F)", &node), "bar");
+    }
+
+    #[test]
+    fn test_expand_dir_file_root() {
+        let mut node = DagNode::new("foo.o".to_string(), false);
+        node.prereqs.push("foo.c".to_string());
+
+        assert_eq!(expand_auto_vars("$(@D)", &node), ".");
+        assert_eq!(expand_auto_vars("$(@F)", &node), "foo.o");
+        assert_eq!(expand_auto_vars("$(<D)", &node), ".");
+        assert_eq!(expand_auto_vars("$(<F)", &node), "foo.c");
     }
 
     #[test]
     fn test_expand_trailing_dollar() {
         let node = DagNode::new("x".to_string(), false);
         assert_eq!(expand_auto_vars("foo$", &node), "foo$");
+    }
+
+    #[test]
+    fn test_expand_combined_vars() {
+        let mut node = DagNode::new("out".to_string(), false);
+        node.prereqs.push("a".to_string());
+        node.prereqs.push("b".to_string());
+        node.order_prereqs.push("dir".to_string());
+        node.stem = Some("foo".to_string());
+
+        assert_eq!(expand_auto_vars("@=$@ <=$< >=$<", &node), "@=out <=a >=a");
+        assert_eq!(expand_auto_vars("^=$^ +=$+", &node), "^=a b +=a b");
     }
 
     // -- Staleness --

@@ -30,7 +30,17 @@ cargo build --release
 - **DAG construction**: Dependency graph with topological sort
 - **Circular dependency detection**
 - **Mtime-based staleness**: Only rebuilds when prerequisites are newer
-- **Automatic variables**: `$@` (target), `$<` (first prereq), `$^` (all prereqs)
+- **Order-only prerequisites**: `target: normal | order_only` syntax
+- **Automatic variables**:
+  - `$@` - target name
+  - `$<` - first prerequisite
+  - `$^` - all prerequisites (unique)
+  - `$+` - all prerequisites (with duplicates)
+  - `$?` - prerequisites newer than target
+  - `$*` - stem (for pattern rules)
+  - `$|` - order-only prerequisites
+  - `$(@D)`, `$(@F)` - directory/file parts of `$@`
+  - `$(<D)`, `$(<F)` - directory/file parts of first prereq
 - **Process execution**: Runs recipes via `/bin/sh`
 - **Error handling**: Exits on first failure, `-k` to continue
 
