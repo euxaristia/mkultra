@@ -45,3 +45,7 @@ cargo test
 cd tests/test3 && ../../target/release/mkultra
 cd tests/test3 && ../../target/release/mkultra  # should show "up to date"
 ```
+
+## License
+
+This project is released into the public domain under the terms of the [UNLICENSE](UNLICENSE).
