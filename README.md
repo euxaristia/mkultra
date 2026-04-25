@@ -5,7 +5,7 @@ A minimal, Unix-philosophy-compliant build tool in Pony.
 ## Usage
 
 ```
-mkultra [target] [-f Makefile] [-iknpqrs]
+mkultra [target] [-f FILE] [-hiknpqrs]
 ```
 
 ### Options
@@ -51,8 +51,9 @@ make uninstall  # remove it
 make test
 
 # Integration tests
-cd tests/test1 && ../../mkultra
-cd tests/test1 && ../../mkultra  # should show "up to date"
+cd tests/test1
+../../mkultra
+../../mkultra  # should show "up to date"
 ```
 
 ## License
