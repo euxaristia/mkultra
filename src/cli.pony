@@ -55,10 +55,11 @@ primitive Cli
 
 primitive Usage
   fun print(out: OutStream) =>
-    out.print("Usage: mkultra [target] [-f makefile] [-iknpqrs]")
+    out.print("Usage: mkultra [target] [-f FILE] [-j N] [-iknpqrs]")
     out.print("")
     out.print("Options:")
     out.print("  -f FILE   Read FILE as the makefile (default: Makefile, then makefile)")
+    out.print("  -j N      Run up to N recipes in parallel (default: 1)")
     out.print("  -i        Ignore errors from commands")
     out.print("  -k        Keep going after errors")
     out.print("  -n        Dry run (print commands but don't execute)")

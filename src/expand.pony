@@ -131,6 +131,13 @@ class _ParsedFunc
     args = args'
     consumed = consumed'
 
+class val AutoVars
+  let target: String
+  let prereqs: Array[String] val
+  new val create(target': String, prereqs': Array[String] val) =>
+    target = target'
+    prereqs = prereqs'
+
 primitive Expand
   fun simple(text: String, vars: Map[String, String] box,
     auth: FileAuth): String
@@ -141,15 +148,15 @@ primitive Expand
     """
     _expand(text, None, vars, auth, Set[String])
 
-  fun with_node(text: String, node: DagNode box,
+  fun with_auto(text: String, auto: AutoVars,
     vars: Map[String, String] box, auth: FileAuth): String
   =>
     """
     Expand variables, functions, and auto-vars ($@/$</$^) for recipes.
     """
-    _expand(text, node, vars, auth, Set[String])
+    _expand(text, auto, vars, auth, Set[String])
 
-  fun _expand(text: String, node: (DagNode box | None),
+  fun _expand(text: String, auto: (AutoVars | None),
     vars: Map[String, String] box, auth: FileAuth,
     expanding: Set[String]): String
   =>
@@ -178,26 +185,26 @@ primitive Expand
         if nc == '(' then
           match _parse_func(text, i + 1)
           | let f: _ParsedFunc =>
-            out.append(_call(f.name, f.args, node, vars, auth, expanding))
+            out.append(_call(f.name, f.args, auto, vars, auth, expanding))
             i = i + f.consumed
             continue
           end
         end
-        // Auto vars only when node is provided
-        match node
-        | let nd: DagNode box =>
+        // Auto vars only when target context is provided
+        match auto
+        | let av: AutoVars =>
           if nc == '@' then
-            out.append(nd.target)
+            out.append(av.target)
             i = i + 2
             continue
           end
           if nc == '<' then
-            try out.append(nd.prereqs(0)?) end
+            try out.append(av.prereqs(0)?) end
             i = i + 2
             continue
           end
           if nc == '^' then
-            out.append(" ".join(nd.prereqs.values()))
+            out.append(" ".join(av.prereqs.values()))
             i = i + 2
             continue
           end
@@ -208,7 +215,7 @@ primitive Expand
             if not expanding.contains(v.name) then
               let raw = try vars(v.name)? else "" end
               expanding.set(v.name)
-              out.append(_expand(raw, node, vars, auth, expanding))
+              out.append(_expand(raw, auto, vars, auth, expanding))
               expanding.unset(v.name)
             end
             i = i + v.consumed
@@ -268,7 +275,7 @@ primitive Expand
     end
     _ParsedFunc(full, "", consumed)
 
-  fun _call(name: String, args: String, node: (DagNode box | None),
+  fun _call(name: String, args: String, auto: (AutoVars | None),
     vars: Map[String, String] box, auth: FileAuth,
     expanding: Set[String]): String
   =>
@@ -281,7 +288,7 @@ primitive Expand
       else
         let raw = try vars(name)? else "" end
         expanding.set(name)
-        let result = _expand(raw, node, vars, auth, expanding)
+        let result = _expand(raw, auto, vars, auth, expanding)
         expanding.unset(name)
         result
       end

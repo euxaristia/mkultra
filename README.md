@@ -5,7 +5,7 @@ A minimal, Unix-philosophy-compliant build tool in Pony.
 ## Usage
 
 ```
-mkultra [target] [-f FILE] [-hiknpqrs]
+mkultra [target] [-f FILE] [-j N] [-hiknpqrs]
 ```
 
 ### Options
@@ -13,6 +13,7 @@ mkultra [target] [-f FILE] [-hiknpqrs]
 | Flag | Description |
 |------|-------------|
 | `-f FILE` | Read FILE as the makefile (default: Makefile, then makefile) |
+| `-j N` | Run up to N recipes in parallel (default: 1) |
 | `-i` | Ignore errors from commands |
 | `-k` | Keep going after errors |
 | `-n` | Dry run (print commands but don't execute) |
@@ -43,6 +44,7 @@ make uninstall  # remove it
 - **Automatic variables**: `$@`, `$<`, `$^`
 - **Variable functions**: `$(wildcard pattern)`, `$(shell command)`
 - **Process execution**: Runs recipes via `/bin/sh`
+- **Parallel jobs**: `-j N` dispatches independent recipes concurrently (effective concurrency is bounded by `--ponythreads`, which defaults to the CPU count)
 - **Error handling**: Exits on first failure, `-k` to continue
 
 ## Testing
