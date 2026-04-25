@@ -96,7 +96,8 @@ class Dag
               cycle.push(node)
               var cur = node
               var hops: USize = 0
-              while hops < 100 do
+              let max_hops = nodes.size()
+              while hops < max_hops do
                 let p = try parent(cur)? else break end
                 if p == prereq then break end
                 cycle.push(p)

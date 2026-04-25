@@ -79,13 +79,7 @@ primitive Shell
       if got == 0 then
         done = true
       else
-        var i: USize = 0
-        try
-          while i < got do
-            buf.push(chunk(i)?)
-            i = i + 1
-          end
-        end
+        buf.append(chunk, 0, got)
       end
     end
     @pclose(fp)
@@ -145,7 +139,7 @@ primitive Expand
     Expand variables and functions in `text` without auto-vars (used for
     parse-time expansion of targets, prereqs, and := RHS).
     """
-    _expand(text, None, vars, auth)
+    _expand(text, None, vars, auth, Set[String])
 
   fun with_node(text: String, node: DagNode box,
     vars: Map[String, String] box, auth: FileAuth): String
@@ -153,10 +147,11 @@ primitive Expand
     """
     Expand variables, functions, and auto-vars ($@/$</$^) for recipes.
     """
-    _expand(text, node, vars, auth)
+    _expand(text, node, vars, auth, Set[String])
 
   fun _expand(text: String, node: (DagNode box | None),
-    vars: Map[String, String] box, auth: FileAuth): String
+    vars: Map[String, String] box, auth: FileAuth,
+    expanding: Set[String]): String
   =>
     let out = recover ref String end
     var i: USize = 0
@@ -183,7 +178,7 @@ primitive Expand
         if nc == '(' then
           match _parse_func(text, i + 1)
           | let f: _ParsedFunc =>
-            out.append(_call(f.name, f.args, node, vars, auth))
+            out.append(_call(f.name, f.args, node, vars, auth, expanding))
             i = i + f.consumed
             continue
           end
@@ -210,8 +205,12 @@ primitive Expand
         if Chars.is_var_char(nc) then
           match _parse_simple(text, i + 1)
           | let v: _ParsedVar =>
-            let raw = try vars(v.name)? else "" end
-            out.append(_expand(raw, node, vars, auth))
+            if not expanding.contains(v.name) then
+              let raw = try vars(v.name)? else "" end
+              expanding.set(v.name)
+              out.append(_expand(raw, node, vars, auth, expanding))
+              expanding.unset(v.name)
+            end
             i = i + v.consumed
             continue
           end
@@ -270,14 +269,20 @@ primitive Expand
     _ParsedFunc(full, "", consumed)
 
   fun _call(name: String, args: String, node: (DagNode box | None),
-    vars: Map[String, String] box, auth: FileAuth): String
+    vars: Map[String, String] box, auth: FileAuth,
+    expanding: Set[String]): String
   =>
     match name
     | "wildcard" => Wildcard.expand(auth, Strs.trim(args))
     | "shell" => Shell.capture(Strs.trim(args))
     else
-      // Default: treat as a variable lookup (for backward-compat with
-      // patterns like $(VAR) which never have args).
-      let raw = try vars(name)? else "" end
-      _expand(raw, node, vars, auth)
+      if expanding.contains(name) then
+        ""
+      else
+        let raw = try vars(name)? else "" end
+        expanding.set(name)
+        let result = _expand(raw, node, vars, auth, expanding)
+        expanding.unset(name)
+        result
+      end
     end
