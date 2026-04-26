@@ -95,7 +95,7 @@ primitive Cli
 
 primitive Usage
   fun print(out: OutStream) =>
-    out.print("Usage: mkultra [target ...] [NAME=value ...] [-f FILE] [-j N] [-eikSnpqrst]")
+    out.print("Usage: mkultra [target] [NAME=value ...] [-f FILE] [-j N] [-eikSnpqrst]")
     out.print("")
     out.print("Options:")
     out.print("  -f FILE   Read FILE as the makefile (default: Makefile, then makefile)")

@@ -5,7 +5,7 @@ A minimal, Unix-philosophy-compliant build tool in Pony.
 ## Usage
 
 ```
-mkultra [target ...] [NAME=value ...] [-f FILE] [-j N] [-eikSnpqrst]
+mkultra [target] [NAME=value ...] [-f FILE] [-j N] [-eikSnpqrst]
 ```
 
 ### Options

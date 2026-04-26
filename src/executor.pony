@@ -268,8 +268,11 @@ actor _Worker
   be run(job: Job) =>
     if _touch then
       // -t: replace recipes with `touch <target>` (skip phony targets).
+      // Shell-quote the target name (single-quoted, internal `'`
+      // escaped) so metacharacters and spaces don't break out.
       if not job.is_phony then
-        let cmd: String val = "touch " + job.target
+        let quoted: String val = _shell_quote(job.target)
+        let cmd: String val = "touch " + quoted
         if not _silent then _out.print(cmd) end
         ShellExec.run(cmd)
       end
@@ -328,3 +331,21 @@ actor _Worker
       end
     end
     (recipe.substring(i.isize()), silent, ignore_err, always_run)
+
+  fun _shell_quote(s: String): String =>
+    """
+    POSIX shell quoting: wrap in single quotes, replace each internal
+    `'` with `'\\''` (close-quote, escaped quote, reopen). Safe for any
+    string the shell would otherwise interpret.
+    """
+    let out = recover ref String end
+    out.push('\'')
+    for c in s.values() do
+      if c == '\'' then
+        out.append("'\\''")
+      else
+        out.push(c)
+      end
+    end
+    out.push('\'')
+    out.clone()

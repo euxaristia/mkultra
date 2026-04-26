@@ -90,14 +90,16 @@ actor Main
       return
     end
 
-    // -e: env vars override Makefile assignments. Re-apply after parse.
+    // -e: env vars override Makefile assignments — but NOT command-line
+    // macro overrides, which are locked in `_overridden`. Use
+    // set_variable, which honours that lock.
     if args.env_override then
       for kv in env.vars.values() do
         try
           let eq = kv.find("=")?.usize()
           let k: String val = kv.substring(0, eq.isize())
           let v: String val = kv.substring((eq + 1).isize())
-          dag.set_override(k, v)
+          dag.set_variable(k, v)
         end
       end
     end
