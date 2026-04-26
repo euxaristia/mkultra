@@ -79,8 +79,11 @@ actor Executor
   var _needs_build: Bool = false
   var _started: Bool = false
 
+  let _touch: Bool
+
   new create(jobs: USize, keep_going: Bool, ignore_errors: Bool,
-    silent: Bool, dry_run: Bool, vars: Map[String, String] val,
+    silent: Bool, dry_run: Bool, touch: Bool,
+    vars: Map[String, String] val,
     auth: FileAuth, out: OutStream, err: OutStream, env: Env,
     target: String)
   =>
@@ -89,6 +92,7 @@ actor Executor
     _ignore_errors = ignore_errors
     _silent = silent
     _dry_run = dry_run
+    _touch = touch
     _vars = vars
     _auth = auth
     _out = out
@@ -211,7 +215,7 @@ actor Executor
         let target = _ready.shift()?
         let job = _by_name(target)?
         let worker = _Worker(this, _vars, _auth, _out, _err,
-          _silent, _dry_run, _ignore_errors)
+          _silent, _dry_run, _ignore_errors, _touch)
         worker.run(job)
         _in_flight = _in_flight + 1
       end
@@ -245,10 +249,11 @@ actor _Worker
   let _silent: Bool
   let _dry_run: Bool
   let _ignore_errors: Bool
+  let _touch: Bool
 
   new create(coord: Executor tag, vars: Map[String, String] val,
     auth: FileAuth, out: OutStream, err: OutStream,
-    silent: Bool, dry_run: Bool, ignore_errors: Bool)
+    silent: Bool, dry_run: Bool, ignore_errors: Bool, touch: Bool)
   =>
     _coord = coord
     _vars = vars
@@ -258,19 +263,30 @@ actor _Worker
     _silent = silent
     _dry_run = dry_run
     _ignore_errors = ignore_errors
+    _touch = touch
 
   be run(job: Job) =>
+    if _touch then
+      // -t: replace recipes with `touch <target>` (skip phony targets).
+      if not job.is_phony then
+        let cmd: String val = "touch " + job.target
+        if not _silent then _out.print(cmd) end
+        ShellExec.run(cmd)
+      end
+      _coord._job_done(job.target, true)
+      return
+    end
+
     let auto = AutoVars(job.target, job.prereqs)
     var ok = true
     for recipe in job.recipes.values() do
-      let at_prefixed =
-        (recipe.size() > 0) and (try recipe(0)? == '@' else false end)
-      let suppressed = at_prefixed or _silent
-      let cmd_raw: String val =
-        if at_prefixed then recipe.substring(1) else recipe end
+      (let cmd_raw, let silent_pref, let ignore_pref, let always_pref) =
+        _parse_prefixes(recipe)
+      let suppressed = silent_pref or _silent
       let expanded: String val = Expand.with_auto(cmd_raw, auto, _vars, _auth)
 
-      if _dry_run then
+      // `-n` skips execution, but `+`-prefixed recipes always run (POSIX).
+      if _dry_run and (not always_pref) then
         if not suppressed then _out.print(expanded) end
         continue
       end
@@ -278,10 +294,37 @@ actor _Worker
 
       let code = ShellExec.run(expanded)
       if code != 0 then
+        if ignore_pref or _ignore_errors then
+          _err.print("mkultra: [" + job.target + "] Error " + code.string()
+            + " (ignored)")
+          continue
+        end
         _err.print("mkultra: *** [" + job.target + "] Error " + code.string())
-        if _ignore_errors then continue end
         ok = false
         break
       end
     end
     _coord._job_done(job.target, ok)
+
+  fun _parse_prefixes(recipe: String): (String, Bool, Bool, Bool) =>
+    """
+    Strip leading `@`, `-`, `+` prefixes (any order, any combination)
+    and return (command, silent, ignore_err, always_run).
+    """
+    var silent = false
+    var ignore_err = false
+    var always_run = false
+    var i: USize = 0
+    let n = recipe.size()
+    try
+      while i < n do
+        let c = recipe(i)?
+        if c == '@' then silent = true
+        elseif c == '-' then ignore_err = true
+        elseif c == '+' then always_run = true
+        else break
+        end
+        i = i + 1
+      end
+    end
+    (recipe.substring(i.isize()), silent, ignore_err, always_run)

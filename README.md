@@ -5,7 +5,7 @@ A minimal, Unix-philosophy-compliant build tool in Pony.
 ## Usage
 
 ```
-mkultra [target] [-f FILE] [-j N] [-hiknpqrs]
+mkultra [target ...] [NAME=value ...] [-f FILE] [-j N] [-eikSnpqrst]
 ```
 
 ### Options
@@ -14,15 +14,22 @@ mkultra [target] [-f FILE] [-j N] [-hiknpqrs]
 |------|-------------|
 | `-f FILE` | Read FILE as the makefile (default: Makefile, then makefile) |
 | `-j N` | Run up to N recipes in parallel (default: 1) |
+| `-e` | Environment variables override Makefile assignments |
 | `-i` | Ignore errors from commands |
 | `-k` | Keep going after errors |
+| `-S` | Cancel a prior `-k` (errors stop the build) |
 | `-n` | Dry run (print commands but don't execute) |
 | `-p` | Print database (rules and variables) |
 | `-q` | Question mode (exit 0 if up to date, 1 otherwise) |
 | `-r` | Disable built-in rules (no-op, for compatibility) |
 | `-s` | Silent mode (don't echo commands) |
+| `-t` | Touch targets instead of running recipes |
 | `-h` | Show help |
 | `--version` | Show version |
+
+Positional `NAME=value` arguments are macro overrides — they take precedence over Makefile assignments and over the environment.
+
+Recipe lines may be prefixed with any combination of `@` (silent), `-` (ignore error), `+` (always run, even under `-n`/`-q`).
 
 ## Building
 

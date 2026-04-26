@@ -67,7 +67,7 @@ actor Main
 
     let dag: Dag ref = Dag
 
-    // Import environment variables (matches GNU make's behavior)
+    // Import environment variables.
     for kv in env.vars.values() do
       try
         let eq = kv.find("=")?.usize()
@@ -77,11 +77,29 @@ actor Main
       end
     end
 
+    // Apply command-line macro overrides BEFORE parsing so the Makefile
+    // sees them (e.g. `?=` skips, `+=` appends to the override).
+    for (k, v) in args.overrides.values() do
+      dag.set_override(k, v)
+    end
+
     match Parser.parse(content, dag, auth)
     | let e: String =>
       env.err.print("mkultra: " + e)
       env.exitcode(2)
       return
+    end
+
+    // -e: env vars override Makefile assignments. Re-apply after parse.
+    if args.env_override then
+      for kv in env.vars.values() do
+        try
+          let eq = kv.find("=")?.usize()
+          let k: String val = kv.substring(0, eq.isize())
+          let v: String val = kv.substring((eq + 1).isize())
+          dag.set_override(k, v)
+        end
+      end
     end
 
     // Cycle detection
@@ -175,8 +193,8 @@ actor Main
       else 1
       end
     let exec = Executor(n_jobs, args.keep_going, args.ignore_errors,
-      args.silent, args.dry_run, vars_val, auth, env.out, env.err, env,
-      build_target)
+      args.silent, args.dry_run, args.touch, vars_val, auth, env.out, env.err,
+      env, build_target)
     exec.start(jobs_val)
 
 primitive FileInfoExists
