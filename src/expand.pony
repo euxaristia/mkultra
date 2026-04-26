@@ -25,6 +25,26 @@ primitive Strs
     end
     s.substring(start.isize(), endp.isize())
 
+  fun is_identifier(s: String box): Bool =>
+    """
+    True iff s starts with [a-zA-Z_] and is followed by [a-zA-Z0-9_]*
+    (POSIX macro name).
+    """
+    if s.size() == 0 then return false end
+    try
+      let first = s(0)?
+      if not (((first >= 'a') and (first <= 'z'))
+          or ((first >= 'A') and (first <= 'Z'))
+          or (first == '_'))
+      then return false end
+      var i: USize = 1
+      while i < s.size() do
+        if not Chars.is_var_char(s(i)?) then return false end
+        i = i + 1
+      end
+      true
+    else false end
+
   fun split_ws(s: String box): Array[String] =>
     let out = Array[String]
     var i: USize = 0
@@ -296,7 +316,25 @@ primitive Expand
     // full = text[start+1 .. i-1]  (excludes the closing ')')
     let full: String val = text.substring((start + 1).isize(), (i - 1).isize())
     let consumed = (i - start) + 1  // accounts for the leading '$'
-    // Try to parse "name args" — name followed by space, or "name,args" or just "name"
+
+    // Substitution reference: `name:s1=s2` (whitespace around `name`
+    // is tolerated). Keep the whole `full` as the name so _call can
+    // route it through the substitution path. Match only when the
+    // text before the first `:` trims to a valid identifier — that
+    // way `$(shell echo "a:b=c")` doesn't get misclassified.
+    try
+      let colon_idx = full.find(":")?
+      let prefix: String box = full.substring(0, colon_idx)
+      if Strs.is_identifier(Strs.trim(prefix)) then
+        let suffix: String box = full.substring(colon_idx + 1)
+        suffix.find("=")?
+        return _ParsedFunc(full, "", consumed)
+      end
+    end
+
+    // Otherwise: split "name args" on space or comma (legacy
+    // wildcard/shell function-call shape). Plain `$(VAR)` falls
+    // through to the no-split case.
     try
       let space_idx = full.find(" ")?
       let name: String val = full.substring(0, space_idx)
@@ -325,7 +363,10 @@ primitive Expand
         let colon_idx = name.find(":")?
         let pattern: String val = name.substring(colon_idx + 1)
         let eq_idx = pattern.find("=")?
-        let var_name: String val = name.substring(0, colon_idx)
+        // Trim the var name in case the source had whitespace like
+        // `$(VAR :s1=s2)` — _parse_func tolerates it; trim here makes
+        // the lookup match a normal identifier.
+        let var_name: String val = Strs.trim(name.substring(0, colon_idx))
         let s1_raw: String val = pattern.substring(0, eq_idx)
         let s2_raw: String val = pattern.substring(eq_idx + 1)
         return _substitute(var_name, s1_raw, s2_raw,
