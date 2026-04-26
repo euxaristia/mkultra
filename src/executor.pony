@@ -72,6 +72,7 @@ actor Executor
   let _dependents: Map[String, Array[String]] = Map[String, Array[String]]
   let _ready: Array[String] = Array[String]
   let _completed: Set[String] = Set[String]
+  let _failed: Set[String] = Set[String]
   var _in_flight: USize = 0
   var _errors: USize = 0
   var _stop_dispatch: Bool = false
@@ -151,6 +152,7 @@ actor Executor
     _in_flight = _in_flight - 1
     if not ok then
       _errors = _errors + 1
+      _failed.set(target)
       if not (_keep_going or _ignore_errors) then
         _stop_dispatch = true
       end
@@ -163,6 +165,21 @@ actor Executor
     if _completed.contains(target) then return end
     try
       let job = _by_name(target)?
+
+      // If any prereq has failed, this target can't be built. Mark it
+      // failed and propagate, so dependents skip too. Important under -k.
+      for p in job.prereqs.values() do
+        if _failed.contains(p) then
+          _failed.set(target)
+          if job.recipes.size() > 0 then
+            _err.print("mkultra: Target '" + target
+              + "' not remade because of errors")
+          end
+          _complete(target)
+          return
+        end
+      end
+
       if (job.recipes.size() == 0) or (not _job_needs_rebuild(job)) then
         _complete(target)
       else
@@ -201,7 +218,10 @@ actor Executor
     end
 
   fun ref _maybe_finalize() =>
-    if (_in_flight == 0) and (_ready.size() == 0) then _finalize() end
+    // In stop-dispatch mode, _ready may still hold queued work that will
+    // never run. Finalize once in-flight reaches 0 regardless.
+    if _in_flight > 0 then return end
+    if _stop_dispatch or (_ready.size() == 0) then _finalize() end
 
   fun ref _finalize() =>
     if _errors > 0 then _env.exitcode(1) end
