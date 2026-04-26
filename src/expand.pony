@@ -182,8 +182,8 @@ primitive Expand
           i = i + 2
           continue
         end
-        if nc == '(' then
-          match _parse_func(text, i + 1)
+        if (nc == '(') or (nc == '{') then
+          match _parse_func(text, i + 1, nc)
           | let f: _ParsedFunc =>
             out.append(_call(f.name, f.args, auto, vars, auth, expanding))
             i = i + f.consumed
@@ -204,7 +204,42 @@ primitive Expand
             continue
           end
           if nc == '^' then
+            // POSIX: deduplicated prereqs.
+            let seen = Set[String]
+            let dedup = Array[String]
+            for p in av.prereqs.values() do
+              if not seen.contains(p) then
+                seen.set(p)
+                dedup.push(p)
+              end
+            end
+            out.append(" ".join(dedup.values()))
+            i = i + 2
+            continue
+          end
+          if nc == '+' then
+            // POSIX: prereqs preserving duplicates.
             out.append(" ".join(av.prereqs.values()))
+            i = i + 2
+            continue
+          end
+          if nc == '?' then
+            // POSIX: prereqs newer than the target (or all, if target absent).
+            let target_mtime = Stat.mtime(auth, av.target)
+            let newer = Array[String]
+            for p in av.prereqs.values() do
+              let pm = Stat.mtime(auth, p)
+              if (target_mtime == 0) or (pm > target_mtime) then
+                newer.push(p)
+              end
+            end
+            out.append(" ".join(newer.values()))
+            i = i + 2
+            continue
+          end
+          if nc == '*' then
+            // Stem — only meaningful inside suffix-rule context (future PR).
+            // Consume to avoid emitting literal `$*`.
             i = i + 2
             continue
           end
@@ -242,16 +277,17 @@ primitive Expand
       None
     end
 
-  fun _parse_func(text: String, start: USize): (_ParsedFunc | None) =>
-    // text(start) is '(', find matching ')'
+  fun _parse_func(text: String, start: USize, opener: U8): (_ParsedFunc | None) =>
+    // text(start) is opener (`(` or `{`); find matching closer.
+    let closer: U8 = if opener == '(' then ')' else '}' end
     var depth: USize = 1
     var i: USize = start + 1
     let n = text.size()
     try
       while (i < n) and (depth > 0) do
         let c = text(i)?
-        if c == '(' then depth = depth + 1
-        elseif c == ')' then depth = depth - 1
+        if c == opener then depth = depth + 1
+        elseif c == closer then depth = depth - 1
         end
         i = i + 1
       end
@@ -283,6 +319,19 @@ primitive Expand
     | "wildcard" => Wildcard.expand(auth, Strs.trim(args))
     | "shell" => Shell.capture(Strs.trim(args))
     else
+      // Substitution reference: `$(VAR:s1=s2)` — replace s1 suffix with s2
+      // in each whitespace-separated word of VAR's value.
+      try
+        let colon_idx = name.find(":")?
+        let pattern: String val = name.substring(colon_idx + 1)
+        let eq_idx = pattern.find("=")?
+        let var_name: String val = name.substring(0, colon_idx)
+        let s1_raw: String val = pattern.substring(0, eq_idx)
+        let s2_raw: String val = pattern.substring(eq_idx + 1)
+        return _substitute(var_name, s1_raw, s2_raw,
+          auto, vars, auth, expanding)
+      end
+      // Plain variable lookup.
       if expanding.contains(name) then
         ""
       else
@@ -293,3 +342,35 @@ primitive Expand
         result
       end
     end
+
+  fun _substitute(var_name: String, s1_raw: String, s2_raw: String,
+    auto: (AutoVars | None), vars: Map[String, String] box,
+    auth: FileAuth, expanding: Set[String]): String
+  =>
+    let value =
+      if expanding.contains(var_name) then
+        ""
+      else
+        let raw = try vars(var_name)? else "" end
+        expanding.set(var_name)
+        let r = _expand(raw, auto, vars, auth, expanding)
+        expanding.unset(var_name)
+        r
+      end
+    let s1 = _expand(s1_raw, auto, vars, auth, expanding)
+    let s2 = _expand(s2_raw, auto, vars, auth, expanding)
+    let words = Strs.split_ws(value)
+    let result = Array[String]
+    for w in words.values() do
+      if s1.size() == 0 then
+        result.push(w + s2)
+      elseif (s1.size() <= w.size())
+          and (w.substring((w.size() - s1.size()).isize()) == s1)
+      then
+        result.push(
+          w.substring(0, (w.size() - s1.size()).isize()) + s2)
+      else
+        result.push(w)
+      end
+    end
+    " ".join(result.values())
