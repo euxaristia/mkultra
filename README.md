@@ -37,11 +37,12 @@ make uninstall  # remove it
 ## Features
 
 - **Makefile parsing**: `target: prereq1 prereq2`, tab-indented recipes, `.PHONY`
-- **Variable assignment**: `=`, `:=`, `?=`, `+=` with `$(VAR)` expansion (cycle-safe)
+- **Variable assignment**: `=`, `:=`, `?=`, `+=` with `$(VAR)` and `${VAR}` expansion (cycle-safe)
+- **Substitution references**: `$(VAR:s1=s2)` replaces the `s1` suffix with `s2` in each word of `VAR`
 - **DAG construction**: Dependency graph with topological sort
 - **Circular dependency detection**
 - **Mtime-based staleness**: Only rebuilds when prerequisites are newer
-- **Automatic variables**: `$@`, `$<`, `$^`
+- **Automatic variables**: `$@`, `$<`, `$^` (dedup), `$+` (keeps dups), `$?` (newer prereqs)
 - **Variable functions**: `$(wildcard pattern)`, `$(shell command)`
 - **Process execution**: Runs recipes via `/bin/sh`
 - **Parallel jobs**: `-j N` dispatches independent recipes concurrently (effective concurrency is bounded by `--ponythreads`, which defaults to the CPU count)
