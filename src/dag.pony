@@ -13,10 +13,17 @@ class DagNode
 class Dag
   let nodes: Map[String, DagNode] = Map[String, DagNode]
   let variables: Map[String, String] = Map[String, String]
+  let _overridden: Set[String] = Set[String]
   var default_target: (String | None) = None
 
   fun ref set_variable(name: String, value: String) =>
+    if not _overridden.contains(name) then
+      variables(name) = value
+    end
+
+  fun ref set_override(name: String, value: String) =>
     variables(name) = value
+    _overridden.set(name)
 
   fun ref ensure_node(target: String, is_phony: Bool): DagNode =>
     try
