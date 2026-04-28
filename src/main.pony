@@ -114,6 +114,11 @@ actor Main
 
     let nodes = dag.order(build_target)
 
+    // Snapshot variables as val so workers can share them.
+    let vars_iso = recover iso Map[String, String] end
+    for (k, v) in dag.variables.pairs() do vars_iso(k) = v end
+    let vars_val: Map[String, String] val = consume vars_iso
+
     // -p: print database
     if args.print_db then
       env.out.print("# Variables")
@@ -151,11 +156,28 @@ actor Main
       return
     end
 
-    // Run
-    let exec = Executor(args, dag.variables, auth, env.out, env.err)
-    if not exec.run(nodes, build_target) then
-      env.exitcode(1)
+    // Snapshot nodes as val Jobs so they can be sent to worker actors.
+    let jobs_iso = recover iso Array[Job] end
+    for nd in nodes.values() do
+      let recipes_iso = recover iso Array[String] end
+      for s in nd.recipes.values() do recipes_iso.push(s) end
+      let prereqs_iso = recover iso Array[String] end
+      for s in nd.prereqs.values() do prereqs_iso.push(s) end
+      jobs_iso.push(Job(nd.target, consume recipes_iso, consume prereqs_iso,
+        nd.is_phony))
     end
+    let jobs_val: Array[Job] val = consume jobs_iso
+
+    // Run
+    let n_jobs: USize =
+      match args.jobs
+      | let n: USize => n
+      else 1
+      end
+    let exec = Executor(n_jobs, args.keep_going, args.ignore_errors,
+      args.silent, args.dry_run, vars_val, auth, env.out, env.err, env,
+      build_target)
+    exec.start(jobs_val)
 
 primitive FileInfoExists
   fun apply(auth: FileAuth, path: String): Bool =>
